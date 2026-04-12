@@ -1,0 +1,18 @@
+[package]
+name = "claude-compose"
+version = "0.1.0"
+edition = "2024"
+description = "Real-time log viewer for Claude Code Agent Teams"
+license = "MIT"
+repository = "https://github.com/HikaruEgashira/claude-compose"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+notify = "8"
+tokio = { version = "1", features = ["full"] }
+crossterm = "0.28"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+anyhow = "1"
