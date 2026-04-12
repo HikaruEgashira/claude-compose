@@ -294,7 +294,7 @@ fn matches_filter(entry_type: &EntryType, filter: &Option<MessageType>) -> bool 
 
 fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
     if opts.json {
-        println!("{}", format_entry_json(entry));
+        println!("{}", format_entry_json(entry, opts.verbose));
     } else {
         println!(
             "{}",

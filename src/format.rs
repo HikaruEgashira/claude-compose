@@ -77,9 +77,39 @@ fn truncate_lines(s: &str, max_lines: usize) -> String {
     format!("{}\n  ... ({remaining} more lines)", shown.join("\n"))
 }
 
+/// Truncate assistant text to the first `max_chars` characters.
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max_chars).collect();
+    format!("{truncated}...")
+}
+
+/// Build a compact copy of a LogEntry for non-verbose JSON output.
+/// - tool_result: first 3 lines + omitted count
+/// - assistant text: first 200 chars + "..."
+/// - tool_use: unchanged (already summarised)
+fn compact_entry(entry: &LogEntry) -> LogEntry {
+    let content = match entry.message_type {
+        EntryType::ToolResult => truncate_lines(&entry.content, 3),
+        EntryType::Assistant => truncate_chars(&entry.content, 200),
+        _ => entry.content.clone(),
+    };
+    LogEntry {
+        content,
+        ..entry.clone()
+    }
+}
+
 /// Format a LogEntry as a single JSON line.
-pub fn format_entry_json(entry: &LogEntry) -> String {
-    serde_json::to_string(entry).unwrap_or_default()
+/// When `verbose` is false, content is truncated to save tokens.
+pub fn format_entry_json(entry: &LogEntry, verbose: bool) -> String {
+    if verbose {
+        serde_json::to_string(entry).unwrap_or_default()
+    } else {
+        serde_json::to_string(&compact_entry(entry)).unwrap_or_default()
+    }
 }
 
 fn resolve_color(color: Option<&str>) -> Color {
@@ -299,11 +329,61 @@ mod tests {
     }
 
     #[test]
-    fn test_format_entry_json() {
+    fn test_format_entry_json_verbose() {
         let entry = make_entry(EntryType::Assistant, "hello");
-        let json = format_entry_json(&entry);
+        let json = format_entry_json(&entry, true);
         assert!(json.contains("\"agent_name\":\"advocate\""));
         assert!(json.contains("\"content\":\"hello\""));
+    }
+
+    #[test]
+    fn test_format_entry_json_compact_tool_result() {
+        let content = "line1\nline2\nline3\nline4\nline5\nline6";
+        let entry = make_entry(EntryType::ToolResult, content);
+        let json = format_entry_json(&entry, false);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let c = parsed["content"].as_str().unwrap();
+        assert!(c.contains("line1"));
+        assert!(c.contains("line3"));
+        assert!(c.contains("3 more lines"));
+        assert!(!c.contains("line4"));
+    }
+
+    #[test]
+    fn test_format_entry_json_compact_assistant() {
+        let long_text = "a".repeat(300);
+        let entry = make_entry(EntryType::Assistant, &long_text);
+        let json = format_entry_json(&entry, false);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let c = parsed["content"].as_str().unwrap();
+        assert!(c.ends_with("..."));
+        // 200 chars + "..."
+        assert_eq!(c.len(), 203);
+    }
+
+    #[test]
+    fn test_format_entry_json_compact_short_assistant_unchanged() {
+        let entry = make_entry(EntryType::Assistant, "short text");
+        let json_compact = format_entry_json(&entry, false);
+        let json_verbose = format_entry_json(&entry, true);
+        assert_eq!(json_compact, json_verbose);
+    }
+
+    #[test]
+    fn test_format_entry_json_compact_tool_use_unchanged() {
+        let mut entry = make_entry(EntryType::ToolUse, "ls -la");
+        entry.tool_name = Some("Bash".to_string());
+        let json_compact = format_entry_json(&entry, false);
+        let json_verbose = format_entry_json(&entry, true);
+        assert_eq!(json_compact, json_verbose);
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte() {
+        let text = "あいうえお".repeat(100); // 500 chars
+        let result = truncate_chars(&text, 200);
+        assert_eq!(result.chars().count(), 203); // 200 + "..."
+        assert!(result.ends_with("..."));
     }
 
     #[test]
