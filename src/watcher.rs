@@ -153,7 +153,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                 &own_ids,
                 &mut seen_session_ids,
             ) {
-                for (jsonl, name, color) in new_files {
+                for (jsonl, name, _) in new_files {
                     if path_to_idx.contains_key(&jsonl) {
                         continue;
                     }
@@ -163,6 +163,8 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                             let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
                         }
                     }
+                    let name = unique_name(&name, &agent_files);
+                    let color = Some(color_for_name(&name));
                     let idx = agent_files.len();
                     agent_files.push(AgentFile {
                         path: jsonl.clone(),
@@ -191,7 +193,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         {
             // New subagent JSONL detected -- register it dynamically
             let meta_path = changed_path.with_extension("meta.json");
-            let name = read_subagent_name(&meta_path).unwrap_or_else(|| {
+            let base_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
                 changed_path
                     .file_stem()
                     .unwrap_or_default()
@@ -200,6 +202,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                     .unwrap_or("unknown")
                     .to_string()
             });
+            let name = unique_name(&base_name, &agent_files);
             let color = Some(color_for_name(&name));
             let idx = agent_files.len();
             agent_files.push(AgentFile {
@@ -250,10 +253,9 @@ fn try_register_session(
 
     let mut results = Vec::new();
 
-    let short_id = &info.session_id[..info.session_id.len().min(8)];
     let name = info
         .agent_name
-        .unwrap_or_else(|| format!("session-{short_id}"));
+        .unwrap_or_else(|| session_display_name(&info.cwd, &info.session_id));
     let color = Some(color_for_name(&name));
     results.push((jsonl, name, color));
 
@@ -331,10 +333,9 @@ fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
             continue;
         }
 
-        let short_id = &info.session_id[..info.session_id.len().min(8)];
         let name = info
             .agent_name
-            .unwrap_or_else(|| format!("session-{short_id}"));
+            .unwrap_or_else(|| session_display_name(&info.cwd, &info.session_id));
         let color = Some(color_for_name(&name));
 
         files.push(AgentFile {
@@ -373,6 +374,9 @@ fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
             }
         }
     }
+
+    // Deduplicate names (e.g. two sessions in the same project dir)
+    deduplicate_names(&mut files);
 
     // Exclude own session to prevent feedback loop
     let own_ids = find_own_session_ids();
@@ -666,6 +670,52 @@ fn resolve_member_sessions(
     results
 }
 
+/// Derive a human-readable session name from the cwd path.
+/// "/Users/hikae/ghq/github.com/Foo/bar" → "bar"
+/// Falls back to "session-{short_id}" when cwd is empty or root.
+fn session_display_name(cwd: &str, session_id: &str) -> String {
+    if !cwd.is_empty() {
+        let trimmed = cwd.trim_end_matches('/');
+        if let Some(pos) = trimmed.rfind('/') {
+            let basename = &trimmed[pos + 1..];
+            if !basename.is_empty() {
+                return basename.to_string();
+            }
+        } else if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    let short_id = &session_id[..session_id.len().min(8)];
+    format!("session-{short_id}")
+}
+
+/// Deduplicate agent names by appending `-2`, `-3`, … to collisions.
+/// The first occurrence keeps the original name.
+fn deduplicate_names(files: &mut [AgentFile]) {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for af in files.iter_mut() {
+        let count = counts.entry(af.agent_name.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            af.agent_name = format!("{}-{}", af.agent_name, count);
+        }
+    }
+}
+
+/// Generate a unique name that doesn't collide with existing agent names.
+fn unique_name(base: &str, existing: &[AgentFile]) -> String {
+    if !existing.iter().any(|af| af.agent_name == base) {
+        return base.to_string();
+    }
+    for i in 2.. {
+        let candidate = format!("{base}-{i}");
+        if !existing.iter().any(|af| af.agent_name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
 const DEFAULT_COLORS: &[&str] = &["blue", "green", "yellow", "cyan", "magenta", "red"];
 
 /// Deterministic color assignment based on agent name.
@@ -889,5 +939,75 @@ mod tests {
             .collect();
 
         assert_eq!(filtered.len(), 1);
+    }
+
+    #[test]
+    fn session_display_name_uses_basename() {
+        assert_eq!(
+            session_display_name("/Users/hikae/ghq/github.com/Foo/bar", "abc12345-xyz"),
+            "bar"
+        );
+    }
+
+    #[test]
+    fn session_display_name_trailing_slash() {
+        assert_eq!(
+            session_display_name("/Users/hikae/project/", "abc12345"),
+            "project"
+        );
+    }
+
+    #[test]
+    fn session_display_name_fallback_on_empty_cwd() {
+        assert_eq!(session_display_name("", "abc12345-long-id"), "session-abc12345");
+    }
+
+    #[test]
+    fn session_display_name_root_path() {
+        assert_eq!(session_display_name("/", "abc12345-long-id"), "session-abc12345");
+    }
+
+    fn make_agent_file(name: &str) -> AgentFile {
+        AgentFile {
+            path: PathBuf::from(format!("/tmp/{name}.jsonl")),
+            agent_name: name.to_string(),
+            agent_color: None,
+            offset: 0,
+        }
+    }
+
+    #[test]
+    fn deduplicate_names_adds_suffix() {
+        let mut files = vec![
+            make_agent_file("my-project"),
+            make_agent_file("my-project"),
+            make_agent_file("my-project"),
+            make_agent_file("other"),
+        ];
+        deduplicate_names(&mut files);
+        assert_eq!(files[0].agent_name, "my-project");
+        assert_eq!(files[1].agent_name, "my-project-2");
+        assert_eq!(files[2].agent_name, "my-project-3");
+        assert_eq!(files[3].agent_name, "other");
+    }
+
+    #[test]
+    fn deduplicate_names_no_duplicates() {
+        let mut files = vec![make_agent_file("a"), make_agent_file("b")];
+        deduplicate_names(&mut files);
+        assert_eq!(files[0].agent_name, "a");
+        assert_eq!(files[1].agent_name, "b");
+    }
+
+    #[test]
+    fn unique_name_no_collision() {
+        let existing = vec![make_agent_file("alpha")];
+        assert_eq!(unique_name("beta", &existing), "beta");
+    }
+
+    #[test]
+    fn unique_name_with_collision() {
+        let existing = vec![make_agent_file("proj"), make_agent_file("proj-2")];
+        assert_eq!(unique_name("proj", &existing), "proj-3");
     }
 }
