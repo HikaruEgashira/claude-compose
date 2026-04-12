@@ -7,12 +7,12 @@ See what every agent is doing, in real time, from one terminal.
 ```
 $ claude-compose logs -f
 [08:46:49] team-lead  │ Let me break this into three parallel tasks...
-[08:46:51] backend    │ 🔧 Read: src/api/handlers.rs
-[08:46:51] frontend   │ 🔧 Glob: **/*.tsx
+[08:46:51] backend    │  Read: src/api/handlers.rs
+[08:46:51] frontend   │  Glob: **/*.tsx
 [08:46:52] backend    │ Found the issue — missing error handler on line 42
-[08:46:53] frontend   │ 📨 → team-lead: Component tree analysis complete
-[08:46:55] tests      │ 🔧 Bash: cargo test
-[08:46:58] tests      │ ✅ Task #3 completed
+[08:46:53] frontend   │  → team-lead: Component tree analysis complete
+[08:46:55] tests      │  Bash: cargo test
+[08:46:58] tests      │  Task #3 completed
 ```
 
 ## Why not `tail -f | jq`?

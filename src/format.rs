@@ -41,13 +41,13 @@ fn format_content(entry: &LogEntry, verbose: bool) -> String {
         EntryType::ToolUse => {
             let tool = entry.tool_name.as_deref().unwrap_or("unknown");
             if tool == "SendMessage" {
-                format!("📨 {}", entry.content)
+                format!(" {}", entry.content)
             } else if tool == "TaskUpdate" && entry.content.contains("completed") {
-                format!("✅ {}", entry.content)
+                format!(" {}", entry.content)
             } else if tool == "TaskCreate" {
-                format!("📋 {}", entry.content)
+                format!(" {}", entry.content)
             } else {
-                format!("🔧 {tool}: {}", entry.content)
+                format!(" {tool}: {}", entry.content)
             }
         }
         EntryType::ToolResult => {
@@ -59,7 +59,7 @@ fn format_content(entry: &LogEntry, verbose: bool) -> String {
         }
         _ => {
             if entry.is_error {
-                format!("❌ {}", entry.content)
+                format!(" {}", entry.content)
             } else {
                 entry.content.clone()
             }
@@ -198,7 +198,7 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "\"claude code log viewer github\"");
         entry.tool_name = Some("WebSearch".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains("🔧 WebSearch:"));
+        assert!(output.contains(" WebSearch:"));
     }
 
     #[test]
@@ -206,7 +206,7 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "→ team-lead: ペインポイントの整理完了");
         entry.tool_name = Some("SendMessage".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains("📨"));
+        assert!(output.contains(""));
     }
 
     #[test]
@@ -214,7 +214,7 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "Task #1 completed");
         entry.tool_name = Some("TaskUpdate".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains("✅"));
+        assert!(output.contains(""));
     }
 
     #[test]
@@ -222,7 +222,7 @@ mod tests {
         let mut entry = make_entry(EntryType::System, "API rate limit exceeded");
         entry.is_error = true;
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains("❌"));
+        assert!(output.contains(""));
     }
 
     #[test]
