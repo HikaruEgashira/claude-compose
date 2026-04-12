@@ -395,12 +395,15 @@ pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
     })
 }
 
-/// Read agent name from a subagent's meta.json (description field).
+/// Read agent name from a subagent's meta.json.
+/// Prefers `description`, falls back to `agentType`.
 pub fn read_subagent_name(meta_path: &std::path::Path) -> Option<String> {
     let data = fs::read_to_string(meta_path).ok()?;
     let v: Value = serde_json::from_str(&data).ok()?;
     v.get("description")
         .and_then(|d| d.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| v.get("agentType").and_then(|t| t.as_str()))
         .map(String::from)
 }
 

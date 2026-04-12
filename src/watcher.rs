@@ -719,10 +719,13 @@ fn unique_name(base: &str, existing: &[AgentFile]) -> String {
 const DEFAULT_COLORS: &[&str] = &["blue", "green", "yellow", "cyan", "magenta", "red"];
 
 /// Deterministic color assignment based on agent name.
-/// Uses a simple hash so the same agent always gets the same color,
-/// regardless of filesystem enumeration order.
+/// Uses FNV-1a for better distribution so agents get varied colors.
 fn color_for_name(name: &str) -> String {
-    let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(u32::from(b)));
+    const FNV_OFFSET: u32 = 2_166_136_261;
+    const FNV_PRIME: u32 = 16_777_619;
+    let hash = name.bytes().fold(FNV_OFFSET, |acc, b| {
+        (acc ^ u32::from(b)).wrapping_mul(FNV_PRIME)
+    });
     DEFAULT_COLORS[(hash as usize) % DEFAULT_COLORS.len()].to_string()
 }
 
@@ -904,8 +907,8 @@ mod tests {
     #[test]
     fn color_for_name_differs_for_different_names() {
         // Not guaranteed for all pairs, but these specific names should differ
-        let c1 = color_for_name("alpha");
-        let c2 = color_for_name("beta");
+        let c1 = color_for_name("Explore");
+        let c2 = color_for_name("general-purpose");
         assert_ne!(c1, c2);
     }
 
