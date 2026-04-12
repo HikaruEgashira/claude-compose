@@ -16,6 +16,7 @@ impl Cli {
 #[derive(Subcommand)]
 pub enum Command {
     /// Stream logs from Claude Code Agent Team sessions
+    #[command(alias = "log")]
     Logs(LogsOpts),
     /// Show agent status (like docker ps)
     Ps(PsOpts),

@@ -9,8 +9,9 @@ use tokio::sync::mpsc;
 use crate::cli::{LogsOpts, MessageType};
 use crate::format::{format_entry, format_entry_json};
 use crate::parser::{
-    discover_member_sessions, find_teams, load_team_config, parse_line, project_log_dir,
-    read_subagent_name, resolve_member_session_via_tmux, EntryType, LogEntry, TeamConfig,
+    claude_home, cwd_to_project_key, discover_member_sessions, load_team_config, parse_line,
+    project_log_dir, read_subagent_name, resolve_member_session_via_tmux, EntryType, LogEntry,
+    TeamConfig,
 };
 
 pub struct AgentFile {
@@ -24,19 +25,27 @@ pub struct AgentFile {
 }
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
-    let team_name = resolve_team(&opts.team)?;
-    let config = load_team_config(&team_name)?;
-
-    // Discover JSONL files scoped to this team's lead session
-    let mut agent_files = discover_team_files(&config)?;
-
-    if agent_files.is_empty() {
-        anyhow::bail!(
-            "No log files found for team '{team_name}'. \
-             The team's lead session ({}) may have ended.",
-            config.lead_session_id
-        );
-    }
+    let mut agent_files = if let Some(ref team_name) = opts.team {
+        let config = load_team_config(team_name)?;
+        let files = discover_team_files(&config)?;
+        if files.is_empty() {
+            anyhow::bail!(
+                "No log files found for team '{team_name}'. \
+                 The team's lead session ({}) may have ended.",
+                config.lead_session_id
+            );
+        }
+        files
+    } else {
+        let files = discover_all_sessions()?;
+        if files.is_empty() {
+            anyhow::bail!(
+                "No active sessions found in ~/.claude/sessions/. \
+                 Start a Claude Code session first, or specify --team."
+            );
+        }
+        files
+    };
 
     // Apply agent name filter
     if !opts.agents.is_empty() {
@@ -105,12 +114,11 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         }
     }
 
-    // Also watch the subagents directory for dynamically spawned agents
-    let subagents_dir = project_log_dir(&config)?
-        .join(&config.lead_session_id)
-        .join("subagents");
-    if subagents_dir.is_dir() && watched_dirs.insert(subagents_dir.clone()) {
-        watcher.watch(&subagents_dir, RecursiveMode::NonRecursive)?;
+    // Also watch subagent directories for dynamically spawned agents
+    for subagents_dir in derive_subagent_dirs(&agent_files) {
+        if watched_dirs.insert(subagents_dir.clone()) {
+            watcher.watch(&subagents_dir, RecursiveMode::NonRecursive)?;
+        }
     }
 
     // Build path -> index lookup (mutable for dynamic additions)
@@ -160,23 +168,170 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn resolve_team(team_opt: &Option<String>) -> anyhow::Result<String> {
-    if let Some(name) = team_opt {
-        return Ok(name.clone());
+/// Discover all active Claude Code sessions from ~/.claude/sessions/.
+/// Each {PID}.json file represents a session; only processes still alive are included.
+fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
+    let claude = claude_home()?;
+    let sessions_dir = claude.join("sessions");
+    if !sessions_dir.is_dir() {
+        return Ok(vec![]);
     }
 
-    let teams = find_teams();
-    match teams.len() {
-        0 => anyhow::bail!("No teams found in ~/.claude/teams/. Create a team first."),
-        1 => Ok(teams.into_iter().next().unwrap()),
-        _ => {
-            eprintln!("Multiple teams found. Please specify --team:");
-            for t in &teams {
-                eprintln!("  {t}");
+    let mut files = Vec::new();
+    let mut seen_session_ids = std::collections::HashSet::new();
+
+    for entry in fs::read_dir(&sessions_dir)?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let Ok(pid) = stem.parse::<u32>() else {
+            continue;
+        };
+
+        if !is_process_alive(pid) {
+            continue;
+        }
+
+        let Some(info) = read_session_file(&path) else {
+            continue;
+        };
+
+        if !seen_session_ids.insert(info.session_id.clone()) {
+            continue;
+        }
+
+        let project_key = cwd_to_project_key(&info.cwd);
+        let project_dir = claude.join("projects").join(&project_key);
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        let jsonl = project_dir.join(format!("{}.jsonl", info.session_id));
+        if !jsonl.is_file() {
+            continue;
+        }
+
+        let short_id = &info.session_id[..info.session_id.len().min(8)];
+        let name = info
+            .agent_name
+            .unwrap_or_else(|| format!("session-{short_id}"));
+        let color = Some(color_for_name(&name));
+
+        files.push(AgentFile {
+            path: jsonl,
+            agent_name: name,
+            agent_color: color,
+            offset: 0,
+        });
+
+        // Subagent JONLs within the session directory
+        let subagents_dir = project_dir.join(&info.session_id).join("subagents");
+        if subagents_dir.is_dir() {
+            if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
+                for sub_entry in sub_entries.flatten() {
+                    let sub_path = sub_entry.path();
+                    if sub_path.extension().is_some_and(|e| e == "jsonl") {
+                        let meta_path = sub_path.with_extension("meta.json");
+                        let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
+                            sub_path
+                                .file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .strip_prefix("agent-")
+                                .unwrap_or("unknown")
+                                .to_string()
+                        });
+                        let sub_color = Some(color_for_name(&sub_name));
+                        files.push(AgentFile {
+                            path: sub_path,
+                            agent_name: sub_name,
+                            agent_color: sub_color,
+                            offset: 0,
+                        });
+                    }
+                }
             }
-            anyhow::bail!("Multiple teams found, use --team to specify")
         }
     }
+
+    // Exclude own session to prevent feedback loop
+    let own_ids = find_own_session_ids();
+    if !own_ids.is_empty() {
+        files.retain(|af| {
+            let stem = af
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            !own_ids.contains(&stem)
+        });
+    }
+
+    Ok(files)
+}
+
+struct SessionInfo {
+    session_id: String,
+    cwd: String,
+    agent_name: Option<String>,
+}
+
+/// Read session metadata from a PID session file using BufReader.
+fn read_session_file(path: &std::path::Path) -> Option<SessionInfo> {
+    use std::io::BufReader;
+
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    let v: serde_json::Value = serde_json::from_reader(reader).ok()?;
+    let session_id = v.get("sessionId")?.as_str()?.to_string();
+    let cwd = v.get("cwd")?.as_str()?.to_string();
+    let agent_name = v
+        .get("agentName")
+        .and_then(|a| a.as_str())
+        .map(String::from);
+    Some(SessionInfo {
+        session_id,
+        cwd,
+        agent_name,
+    })
+}
+
+/// Check if a process is still alive using kill -0.
+fn is_process_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Derive subagent directories from discovered AgentFile paths.
+/// For a JSONL at `projects/{key}/{session_id}.jsonl`, the subagents dir
+/// is `projects/{key}/{session_id}/subagents/`.
+fn derive_subagent_dirs(files: &[AgentFile]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for af in files {
+        // Skip files already inside a subagents directory
+        if af
+            .path
+            .parent()
+            .and_then(|p| p.file_name())
+            .is_some_and(|n| n == "subagents")
+        {
+            continue;
+        }
+        if let (Some(stem), Some(parent)) = (af.path.file_stem(), af.path.parent()) {
+            let subagents = parent.join(stem).join("subagents");
+            if subagents.is_dir() {
+                dirs.push(subagents);
+            }
+        }
+    }
+    dirs
 }
 
 /// Discover JSONL files scoped to a specific team's lead session.
