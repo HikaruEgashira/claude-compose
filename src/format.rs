@@ -12,16 +12,16 @@ pub fn format_entry(
     no_color: bool,
     max_name_width: usize,
 ) -> String {
-    let no_color = no_color || !std::io::stdout().is_terminal();
+    let no_color = no_color || !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
 
     let ts = format_timestamp(&entry.timestamp);
     let timestamp = format!("[{ts}]");
     let name = format!("{:<width$}", entry.agent_name, width = max_name_width);
 
-    let content = format_content(entry, verbose);
+    let content = format_content(entry, verbose, no_color);
 
     if no_color {
-        return format!("{timestamp} {name}│ {content}");
+        return format!("{timestamp} {name}| {content}");
     }
 
     let color = resolve_color(entry.agent_color.as_deref());
@@ -36,18 +36,17 @@ pub fn format_entry(
     format!("{timestamp} {styled_name}│ {styled_content}")
 }
 
-fn format_content(entry: &LogEntry, verbose: bool) -> String {
+fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
     match entry.message_type {
         EntryType::ToolUse => {
             let tool = entry.tool_name.as_deref().unwrap_or("unknown");
-            if tool == "SendMessage" {
-                format!(" {}", entry.content)
-            } else if tool == "TaskUpdate" && entry.content.contains("completed") {
-                format!(" {}", entry.content)
-            } else if tool == "TaskCreate" {
-                format!(" {}", entry.content)
+            let icon = tool_icon(tool, &entry.content, no_color);
+            if matches!(tool, "SendMessage" | "TaskCreate")
+                || (tool == "TaskUpdate" && entry.content.contains("completed"))
+            {
+                format!("{icon} {}", entry.content)
             } else {
-                format!(" {tool}: {}", entry.content)
+                format!("{icon} {tool}: {}", entry.content)
             }
         }
         EntryType::ToolResult => {
@@ -59,10 +58,29 @@ fn format_content(entry: &LogEntry, verbose: bool) -> String {
         }
         _ => {
             if entry.is_error {
-                format!(" {}", entry.content)
+                let icon = if no_color { "[err]" } else { "\u{f071}" };
+                format!("{icon} {}", entry.content)
             } else {
                 entry.content.clone()
             }
+        }
+    }
+}
+
+fn tool_icon(tool: &str, content: &str, no_color: bool) -> &'static str {
+    if no_color {
+        match tool {
+            "SendMessage" => "[msg]",
+            "TaskUpdate" if content.contains("completed") => "[ok]",
+            "TaskCreate" => "[new]",
+            _ => "[tool]",
+        }
+    } else {
+        match tool {
+            "SendMessage" => "\u{f1d8}",    // paper-plane
+            "TaskUpdate" if content.contains("completed") => "\u{f00c}", // check
+            "TaskCreate" => "\u{f0ca}",      // list
+            _ => "\u{f0ad}",                 // wrench
         }
     }
 }
@@ -162,7 +180,7 @@ pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
         return print_ps_json(&teams, explicit_team);
     }
 
-    let no_color = !std::io::stdout().is_terminal();
+    let no_color = !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
 
     for team_name in &teams {
         let config = match load_team_config(team_name) {
@@ -275,15 +293,15 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "\"claude code log viewer github\"");
         entry.tool_name = Some("WebSearch".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains(" WebSearch:"));
+        assert!(output.contains("[tool] WebSearch:"));
     }
 
     #[test]
     fn test_format_send_message() {
-        let mut entry = make_entry(EntryType::ToolUse, "→ team-lead: ペインポイントの整理完了");
+        let mut entry = make_entry(EntryType::ToolUse, "-> team-lead: done");
         entry.tool_name = Some("SendMessage".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains(""));
+        assert!(output.contains("[msg]"));
     }
 
     #[test]
@@ -291,7 +309,7 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "Task #1 completed");
         entry.tool_name = Some("TaskUpdate".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains(""));
+        assert!(output.contains("[ok]"));
     }
 
     #[test]
@@ -299,7 +317,7 @@ mod tests {
         let mut entry = make_entry(EntryType::System, "API rate limit exceeded");
         entry.is_error = true;
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains(""));
+        assert!(output.contains("[err]"));
     }
 
     #[test]
@@ -415,11 +433,21 @@ mod tests {
                 name: "agent-a".to_string(),
                 color: None,
                 is_active: true,
+                tmux_pane_id: None,
+                agent_id: None,
+                model: None,
+                cwd: None,
+                backend_type: None,
             },
             MemberInfo {
                 name: "agent-b".to_string(),
                 color: None,
                 is_active: false,
+                tmux_pane_id: None,
+                agent_id: None,
+                model: None,
+                cwd: None,
+                backend_type: None,
             },
         ];
 

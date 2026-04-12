@@ -27,6 +27,9 @@ claude-compose logs -f backend frontend       # filter by agent
 claude-compose logs --type assistant           # filter by message type
 claude-compose logs --json | jq '.agent_name'  # pipe-friendly
 claude-compose ps                              # agent status table
+claude-compose ps --json                       # JSON output for scripting
+claude-compose up                              # start team in tmux
+claude-compose down                            # stop team
 ```
 
 No hooks, no database, no web server. Reads `~/.claude/` directly.

@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "claude-compose", about = "Real-time log viewer for Claude Code Agent Teams")]
+#[command(name = "claude-compose", version, about = "Real-time log viewer for Claude Code Agent Teams")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -19,6 +19,10 @@ pub enum Command {
     Logs(LogsOpts),
     /// Show agent status (like docker ps)
     Ps(PsOpts),
+    /// Start team members in tmux panes (like docker compose up)
+    Up(UpOpts),
+    /// Stop team members (like docker compose down)
+    Down(DownOpts),
 }
 
 #[derive(clap::Args)]
@@ -64,6 +68,20 @@ pub struct PsOpts {
     /// Output as JSON (pipe-friendly)
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(clap::Args)]
+pub struct UpOpts {
+    /// Team name (auto-detect if omitted)
+    #[arg(long)]
+    pub team: Option<String>,
+}
+
+#[derive(clap::Args)]
+pub struct DownOpts {
+    /// Team name (auto-detect if omitted)
+    #[arg(long)]
+    pub team: Option<String>,
 }
 
 #[derive(Clone, ValueEnum)]

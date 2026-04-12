@@ -1,6 +1,7 @@
 mod cli;
 mod format;
 mod parser;
+mod tmux;
 mod watcher;
 
 use cli::{Cli, Command};
@@ -15,6 +16,12 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Ps(opts) => {
             format::print_ps(opts)?;
+        }
+        Command::Up(opts) => {
+            tmux::run_up(opts)?;
+        }
+        Command::Down(opts) => {
+            tmux::run_down(opts)?;
         }
     }
 
