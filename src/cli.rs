@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "claude-compose", version, about = "Real-time log viewer for Claude Code Agent Teams")]
+#[command(
+    name = "claude-compose",
+    version,
+    about = "Real-time log viewer for Claude Code Agent Teams"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

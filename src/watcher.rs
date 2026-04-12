@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use crate::cli::{LogsOpts, MessageType};
 use crate::format::{format_entry, format_entry_json};
 use crate::parser::{
-    claude_home, cwd_to_project_key, discover_member_sessions, load_team_config, parse_line,
-    project_log_dir, read_subagent_name, resolve_member_session_via_tmux, EntryType, LogEntry,
-    TeamConfig,
+    EntryType, LogEntry, TeamConfig, claude_home, cwd_to_project_key, discover_member_sessions,
+    load_team_config, parse_line, project_log_dir, read_subagent_name,
+    resolve_member_session_via_tmux,
 };
 
 pub struct AgentFile {
@@ -147,12 +147,9 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         if changed_path.parent() == Some(sessions_dir.as_ref())
             && changed_path.extension().is_some_and(|e| e == "json")
         {
-            if let Some(new_files) = try_register_session(
-                &changed_path,
-                &claude,
-                &own_ids,
-                &mut seen_session_ids,
-            ) {
+            if let Some(new_files) =
+                try_register_session(&changed_path, &claude, &own_ids, &mut seen_session_ids)
+            {
                 for (jsonl, name, _) in new_files {
                     if path_to_idx.contains_key(&jsonl) {
                         continue;
@@ -597,7 +594,7 @@ fn read_new_lines(af: &mut AgentFile) -> anyhow::Result<Vec<LogEntry>> {
 
     // Find the last newline — everything after it is an incomplete line
     let consumed = match raw.iter().rposition(|&b| b == b'\n') {
-        Some(pos) => pos + 1, // include the newline
+        Some(pos) => pos + 1,      // include the newline
         None => return Ok(vec![]), // no complete line yet
     };
 
@@ -794,10 +791,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
         .args(["-o", "ppid=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -962,12 +956,18 @@ mod tests {
 
     #[test]
     fn session_display_name_fallback_on_empty_cwd() {
-        assert_eq!(session_display_name("", "abc12345-long-id"), "session-abc12345");
+        assert_eq!(
+            session_display_name("", "abc12345-long-id"),
+            "session-abc12345"
+        );
     }
 
     #[test]
     fn session_display_name_root_path() {
-        assert_eq!(session_display_name("/", "abc12345-long-id"), "session-abc12345");
+        assert_eq!(
+            session_display_name("/", "abc12345-long-id"),
+            "session-abc12345"
+        );
     }
 
     fn make_agent_file(name: &str) -> AgentFile {

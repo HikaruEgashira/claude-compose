@@ -3,7 +3,7 @@ use std::io::IsTerminal;
 use crossterm::style::{Color, Stylize};
 
 use crate::cli::PsOpts;
-use crate::parser::{find_teams, format_timestamp, load_team_config, EntryType, LogEntry};
+use crate::parser::{EntryType, LogEntry, find_teams, format_timestamp, load_team_config};
 
 /// Format a LogEntry for terminal output.
 pub fn format_entry(
@@ -12,7 +12,8 @@ pub fn format_entry(
     no_color: bool,
     max_name_width: usize,
 ) -> String {
-    let no_color = no_color || !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
+    let no_color =
+        no_color || !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
 
     let ts = format_timestamp(&entry.timestamp);
     let timestamp = format!("[{ts}]");
@@ -98,10 +99,10 @@ fn tool_icon(tool: &str, content: &str, no_color: bool) -> &'static str {
         }
     } else {
         match tool {
-            "SendMessage" => "\u{f1d8}",    // paper-plane
+            "SendMessage" => "\u{f1d8}", // paper-plane
             "TaskUpdate" if content.contains("completed") => "\u{f00c}", // check
-            "TaskCreate" => "\u{f0ca}",      // list
-            _ => "\u{f0ad}",                 // wrench
+            "TaskCreate" => "\u{f0ca}",  // list
+            _ => "\u{f0ad}",             // wrench
         }
     }
 }
@@ -216,10 +217,7 @@ pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
         };
 
         if !no_color {
-            println!(
-                "{}",
-                format!("Team: {team_name}").with(Color::Cyan).bold()
-            );
+            println!("{}", format!("Team: {team_name}").with(Color::Cyan).bold());
         } else {
             println!("Team: {team_name}");
         }
@@ -514,7 +512,12 @@ mod tests {
         assert_eq!(members_arr[1]["active"], false);
 
         // Must not contain unexpected keys
-        let member_keys: Vec<&str> = members_arr[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let member_keys: Vec<&str> = members_arr[0]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
         assert_eq!(member_keys.len(), 2);
         assert!(member_keys.contains(&"active"));
         assert!(member_keys.contains(&"agent_name"));

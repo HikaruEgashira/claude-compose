@@ -143,9 +143,7 @@ fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String {
             let summary = input
                 .get("summary")
                 .and_then(|v| v.as_str())
-                .or_else(|| {
-                    input.get("message").and_then(|m| m.as_str())
-                })
+                .or_else(|| input.get("message").and_then(|m| m.as_str()))
                 .unwrap_or("");
             format!("→ {to}: {summary}")
         }
@@ -167,7 +165,10 @@ fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String {
             truncate_chars(cmd, 80)
         }
         "Read" | "Write" | "Edit" => {
-            let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             path.to_string()
         }
         "Grep" => {
@@ -379,14 +380,8 @@ pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
                             .and_then(|n| n.as_str())
                             .unwrap_or("unknown")
                             .to_string(),
-                        color: m
-                            .get("color")
-                            .and_then(|c| c.as_str())
-                            .map(String::from),
-                        is_active: m
-                            .get("isActive")
-                            .and_then(|a| a.as_bool())
-                            .unwrap_or(false),
+                        color: m.get("color").and_then(|c| c.as_str()).map(String::from),
+                        is_active: m.get("isActive").and_then(|a| a.as_bool()).unwrap_or(false),
                         tmux_pane_id: pane_id,
                     }
                 })
@@ -663,7 +658,10 @@ mod tests {
         fs::write(&jsonl_path, content).unwrap();
 
         let result = identify_member_jsonl(&jsonl_path, "my-team", "lead-session-id");
-        assert_eq!(result, Some(("abc123".to_string(), "backend-dev".to_string())));
+        assert_eq!(
+            result,
+            Some(("abc123".to_string(), "backend-dev".to_string()))
+        );
 
         // Lead session should be excluded
         let result = identify_member_jsonl(&jsonl_path, "my-team", "abc123");

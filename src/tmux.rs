@@ -30,7 +30,14 @@ pub fn run_up(opts: UpOpts) -> anyhow::Result<()> {
 
     // Create new session, start claude, attach
     let new = Command::new("tmux")
-        .args(["new-session", "-d", "-s", &session, "-c", &abs.to_string_lossy()])
+        .args([
+            "new-session",
+            "-d",
+            "-s",
+            &session,
+            "-c",
+            &abs.to_string_lossy(),
+        ])
         .output()?;
     if !new.status.success() {
         anyhow::bail!(
