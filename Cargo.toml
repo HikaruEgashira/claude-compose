@@ -1,6 +1,6 @@
 [package]
 name = "claude-compose"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Real-time log viewer for Claude Code Agent Teams"
