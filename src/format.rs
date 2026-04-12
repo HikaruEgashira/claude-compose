@@ -30,7 +30,7 @@ pub fn format_entry(
     let styled_content = if entry.is_error {
         content.with(Color::Red).to_string()
     } else {
-        content
+        render_inline_bold(&content)
     };
 
     format!("{timestamp} {styled_name}│ {styled_content}")
@@ -65,6 +65,27 @@ fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
             }
         }
     }
+}
+
+/// Convert markdown `**bold**` to ANSI bold sequences.
+fn render_inline_bold(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find("**") {
+        result.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        if let Some(end) = after_open.find("**") {
+            let bold_text = &after_open[..end];
+            result.push_str(&bold_text.bold().to_string());
+            rest = &after_open[end + 2..];
+        } else {
+            // No closing **, emit the rest as-is
+            result.push_str(&rest[start..]);
+            return result;
+        }
+    }
+    result.push_str(rest);
+    result
 }
 
 fn tool_icon(tool: &str, content: &str, no_color: bool) -> &'static str {
@@ -411,6 +432,26 @@ mod tests {
         // Should show HH:MM:SS not full ISO 8601
         assert!(output.contains("[12:57:14]"));
         assert!(!output.contains("2026-04-12"));
+    }
+
+    #[test]
+    fn test_render_inline_bold() {
+        let result = render_inline_bold("hello **world** foo");
+        assert!(result.contains("world"));
+        // Should contain ANSI bold sequences
+        assert!(result.contains("\x1b["));
+        assert!(!result.contains("**"));
+    }
+
+    #[test]
+    fn test_render_inline_bold_no_markers() {
+        assert_eq!(render_inline_bold("plain text"), "plain text");
+    }
+
+    #[test]
+    fn test_render_inline_bold_unclosed() {
+        let result = render_inline_bold("open **bold but no close");
+        assert_eq!(result, "open **bold but no close");
     }
 
     #[test]
