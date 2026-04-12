@@ -60,6 +60,10 @@ pub struct PsOpts {
     /// Team name (auto-detect if omitted)
     #[arg(long)]
     pub team: Option<String>,
+
+    /// Output as JSON (pipe-friendly)
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Clone, ValueEnum)]

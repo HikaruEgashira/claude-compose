@@ -34,7 +34,6 @@ pub struct TeamConfig {
 #[derive(Debug, Clone)]
 pub struct MemberInfo {
     pub name: String,
-    pub agent_id: String,
     pub color: Option<String>,
     pub is_active: bool,
 }
@@ -365,11 +364,6 @@ pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("unknown")
-                        .to_string(),
-                    agent_id: m
-                        .get("agentId")
-                        .and_then(|a| a.as_str())
-                        .unwrap_or("")
                         .to_string(),
                     color: m.get("color").and_then(|c| c.as_str()).map(String::from),
                     is_active: m

@@ -112,6 +112,7 @@ fn resolve_color(color: Option<&str>) -> Color {
 
 /// Print agent status table (claude-compose ps).
 pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
+    let explicit_team = opts.team.is_some();
     let teams = if let Some(ref name) = opts.team {
         vec![name.clone()]
     } else {
@@ -119,8 +120,16 @@ pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
     };
 
     if teams.is_empty() {
-        println!("No active teams found.");
+        if opts.json {
+            println!("[]");
+        } else {
+            println!("No active teams found.");
+        }
         return Ok(());
+    }
+
+    if opts.json {
+        return print_ps_json(&teams, explicit_team);
     }
 
     let no_color = !std::io::stdout().is_terminal();
@@ -129,6 +138,9 @@ pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
         let config = match load_team_config(team_name) {
             Ok(c) => c,
             Err(e) => {
+                if explicit_team {
+                    anyhow::bail!("team '{team_name}' not found: {e}");
+                }
                 eprintln!("Warning: skipping team '{team_name}': {e}");
                 continue;
             }
@@ -165,6 +177,41 @@ pub fn print_ps(opts: PsOpts) -> anyhow::Result<()> {
         println!();
     }
 
+    Ok(())
+}
+
+fn print_ps_json(teams: &[String], explicit_team: bool) -> anyhow::Result<()> {
+    let mut result: Vec<serde_json::Value> = Vec::new();
+
+    for team_name in teams {
+        let config = match load_team_config(team_name) {
+            Ok(c) => c,
+            Err(e) => {
+                if explicit_team {
+                    anyhow::bail!("team '{team_name}' not found: {e}");
+                }
+                continue;
+            }
+        };
+
+        let members: Vec<serde_json::Value> = config
+            .members
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "agent_name": m.name,
+                    "active": m.is_active,
+                })
+            })
+            .collect();
+
+        result.push(serde_json::json!({
+            "team": team_name,
+            "members": members,
+        }));
+    }
+
+    println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -266,5 +313,69 @@ mod tests {
         // Should show HH:MM:SS not full ISO 8601
         assert!(output.contains("[12:57:14]"));
         assert!(!output.contains("2026-04-12"));
+    }
+
+    #[test]
+    fn test_ps_json_explicit_nonexistent_team_errors() {
+        let opts = PsOpts {
+            team: Some("nonexistent-team-xyz".to_string()),
+            json: true,
+        };
+        let result = print_ps(opts);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_ps_json_schema() {
+        // Verify JSON schema matches spec:
+        // [{"team":"name","members":[{"agent_name":"x","active":true}]}]
+        use crate::parser::MemberInfo;
+        let members = vec![
+            MemberInfo {
+                name: "agent-a".to_string(),
+                color: None,
+                is_active: true,
+            },
+            MemberInfo {
+                name: "agent-b".to_string(),
+                color: None,
+                is_active: false,
+            },
+        ];
+
+        let json_members: Vec<serde_json::Value> = members
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "agent_name": m.name,
+                    "active": m.is_active,
+                })
+            })
+            .collect();
+
+        let result = vec![serde_json::json!({
+            "team": "test-team",
+            "members": json_members,
+        })];
+
+        let output = serde_json::to_string(&result).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
+
+        let arr = parsed.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["team"], "test-team");
+
+        let members_arr = arr[0]["members"].as_array().unwrap();
+        assert_eq!(members_arr.len(), 2);
+        assert_eq!(members_arr[0]["agent_name"], "agent-a");
+        assert_eq!(members_arr[0]["active"], true);
+        assert_eq!(members_arr[1]["agent_name"], "agent-b");
+        assert_eq!(members_arr[1]["active"], false);
+
+        // Must not contain unexpected keys
+        let member_keys: Vec<&str> = members_arr[0].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(member_keys.len(), 2);
+        assert!(member_keys.contains(&"active"));
+        assert!(member_keys.contains(&"agent_name"));
     }
 }

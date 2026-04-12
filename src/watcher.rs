@@ -13,14 +13,14 @@ use crate::parser::{
     LogEntry, TeamConfig,
 };
 
-struct AgentFile {
-    path: PathBuf,
-    agent_name: String,
-    agent_color: Option<String>,
+pub struct AgentFile {
+    pub path: PathBuf,
+    pub agent_name: String,
+    pub agent_color: Option<String>,
     /// Byte offset of the last fully-read newline. Only complete lines
     /// (terminated by '\n') are consumed; a partial trailing line is left
     /// for the next read to pick up once the writer flushes the newline.
-    offset: u64,
+    pub offset: u64,
 }
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
