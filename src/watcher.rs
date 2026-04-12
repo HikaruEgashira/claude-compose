@@ -124,10 +124,8 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     // Watch ~/.claude/sessions/ to discover new sessions dynamically
     let claude = claude_home()?;
     let sessions_dir = claude.join("sessions");
-    if sessions_dir.is_dir() {
-        if watched_dirs.insert(sessions_dir.clone()) {
-            watcher.watch(&sessions_dir, RecursiveMode::NonRecursive)?;
-        }
+    if sessions_dir.is_dir() && watched_dirs.insert(sessions_dir.clone()) {
+        watcher.watch(&sessions_dir, RecursiveMode::NonRecursive)?;
     }
 
     let own_ids = find_own_session_ids();
