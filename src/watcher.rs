@@ -189,16 +189,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
             && !path_to_idx.contains_key(&changed_path)
         {
             // New subagent JSONL detected -- register it dynamically
-            let meta_path = changed_path.with_extension("meta.json");
-            let base_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                changed_path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .strip_prefix("agent-")
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
+            let (base_name, _) = resolve_subagent_info(&changed_path);
             let name = unique_name(&base_name, &agent_files);
             let color = Some(color_for_name(&name));
             let idx = agent_files.len();
@@ -258,26 +249,8 @@ fn try_register_session(
 
     // Subagent JSONLs
     let subagents_dir = project_dir.join(&info.session_id).join("subagents");
-    if subagents_dir.is_dir() {
-        if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
-            for sub_entry in sub_entries.flatten() {
-                let sub_path = sub_entry.path();
-                if sub_path.extension().is_some_and(|e| e == "jsonl") {
-                    let meta_path = sub_path.with_extension("meta.json");
-                    let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                        sub_path
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .strip_prefix("agent-")
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
-                    let sub_color = Some(color_for_name(&sub_name));
-                    results.push((sub_path, sub_name, sub_color));
-                }
-            }
-        }
+    for af in scan_subagent_dir(&subagents_dir) {
+        results.push((af.path, af.agent_name, af.agent_color));
     }
 
     Some(results)
@@ -342,34 +315,9 @@ fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
             offset: 0,
         });
 
-        // Subagent JONLs within the session directory
+        // Subagent JSONLs within the session directory
         let subagents_dir = project_dir.join(&info.session_id).join("subagents");
-        if subagents_dir.is_dir() {
-            if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
-                for sub_entry in sub_entries.flatten() {
-                    let sub_path = sub_entry.path();
-                    if sub_path.extension().is_some_and(|e| e == "jsonl") {
-                        let meta_path = sub_path.with_extension("meta.json");
-                        let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                            sub_path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .strip_prefix("agent-")
-                                .unwrap_or("unknown")
-                                .to_string()
-                        });
-                        let sub_color = Some(color_for_name(&sub_name));
-                        files.push(AgentFile {
-                            path: sub_path,
-                            agent_name: sub_name,
-                            agent_color: sub_color,
-                            offset: 0,
-                        });
-                    }
-                }
-            }
-        }
+        files.extend(scan_subagent_dir(&subagents_dir));
     }
 
     // Deduplicate names (e.g. two sessions in the same project dir)
@@ -424,6 +372,48 @@ fn is_process_alive(pid: u32) -> bool {
         .stderr(std::process::Stdio::null())
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// Resolve a subagent's display name and color from its JSONL path.
+/// Reads the companion `.meta.json` if it exists; falls back to stripping
+/// the `agent-` prefix from the file stem.
+fn resolve_subagent_info(jsonl_path: &std::path::Path) -> (String, Option<String>) {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    let name = read_subagent_name(&meta_path).unwrap_or_else(|| {
+        jsonl_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .strip_prefix("agent-")
+            .unwrap_or("unknown")
+            .to_string()
+    });
+    let color = Some(color_for_name(&name));
+    (name, color)
+}
+
+/// Scan a subagents directory and return AgentFile entries for each .jsonl found.
+fn scan_subagent_dir(subagents_dir: &std::path::Path) -> Vec<AgentFile> {
+    let mut files = Vec::new();
+    if !subagents_dir.is_dir() {
+        return files;
+    }
+    let Ok(entries) = fs::read_dir(subagents_dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            let (name, color) = resolve_subagent_info(&path);
+            files.push(AgentFile {
+                path,
+                agent_name: name,
+                agent_color: color,
+                offset: 0,
+            });
+        }
+    }
+    files
 }
 
 /// Derive subagent directories from discovered AgentFile paths.
@@ -487,33 +477,7 @@ fn discover_team_files(config: &TeamConfig) -> anyhow::Result<Vec<AgentFile>> {
 
     // 2. Subagent JSONLs within the lead session directory
     let subagents_dir = project_dir.join(session_id).join("subagents");
-    if subagents_dir.is_dir()
-        && let Ok(entries) = fs::read_dir(&subagents_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let meta_path = path.with_extension("meta.json");
-                let name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                    path.file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .strip_prefix("agent-")
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-
-                let color = Some(color_for_name(&name));
-
-                files.push(AgentFile {
-                    path,
-                    agent_name: name,
-                    agent_color: color,
-                    offset: 0,
-                });
-            }
-        }
-    }
+    files.extend(scan_subagent_dir(&subagents_dir));
 
     // 3. Team member sessions (tmux-based members with independent JSONL files)
     let known_sessions = collect_known_sessions(&files);
