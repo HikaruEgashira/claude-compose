@@ -25,6 +25,19 @@ pub struct AgentFile {
 }
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
+    let mut agent_files = discover_files(&opts)?;
+    let max_name_width = tail_entries(&mut agent_files, &opts)?;
+
+    if opts.follow {
+        follow_events(&mut agent_files, &opts, max_name_width).await?;
+    }
+
+    Ok(())
+}
+
+/// Discover agent log files based on --team flag or auto-detection.
+/// Applies the agent name filter if specified.
+fn discover_files(opts: &LogsOpts) -> anyhow::Result<Vec<AgentFile>> {
     let mut agent_files = if let Some(ref team_name) = opts.team {
         let config = load_team_config(team_name)?;
         let files = discover_team_files(&config)?;
@@ -47,7 +60,6 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         files
     };
 
-    // Apply agent name filter
     if !opts.agents.is_empty() {
         agent_files.retain(|af| {
             opts.agents
@@ -59,6 +71,12 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         }
     }
 
+    Ok(agent_files)
+}
+
+/// Read existing log entries from all agent files, apply tail limit, and print.
+/// Returns the computed max_name_width for consistent formatting in follow mode.
+fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Result<usize> {
     let max_name_width = agent_files
         .iter()
         .map(|af| af.agent_name.len())
@@ -66,32 +84,29 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         .unwrap_or(10)
         .max(10);
 
-    // Read existing content (tail)
     let mut all_entries: Vec<LogEntry> = Vec::new();
-    for af in &mut agent_files {
-        let entries = read_file_entries(af)?;
-        all_entries.extend(entries);
+    for af in agent_files.iter_mut() {
+        all_entries.extend(read_file_entries(af)?);
     }
 
-    // Sort by timestamp
     all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Apply tail limit
     let start = all_entries.len().saturating_sub(opts.tail);
-    let tail_entries = &all_entries[start..];
-
-    for entry in tail_entries {
-        if !matches_filter(&entry.message_type, &opts.type_filter) {
-            continue;
+    for entry in &all_entries[start..] {
+        if matches_filter(&entry.message_type, &opts.type_filter) {
+            print_entry(entry, opts, max_name_width);
         }
-        print_entry(entry, &opts, max_name_width);
     }
 
-    if !opts.follow {
-        return Ok(());
-    }
+    Ok(max_name_width)
+}
 
-    // Follow mode: watch for file changes using notify
+/// Watch for file changes and stream new log entries in real time.
+async fn follow_events(
+    agent_files: &mut Vec<AgentFile>,
+    opts: &LogsOpts,
+    max_name_width: usize,
+) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
@@ -106,7 +121,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
 
     // Watch directories containing our log files
     let mut watched_dirs = std::collections::HashSet::new();
-    for af in &agent_files {
+    for af in agent_files.iter() {
         if let Some(dir) = af.path.parent() {
             if watched_dirs.insert(dir.to_path_buf()) {
                 watcher.watch(dir, RecursiveMode::NonRecursive)?;
@@ -115,7 +130,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     }
 
     // Also watch subagent directories for dynamically spawned agents
-    for subagents_dir in derive_subagent_dirs(&agent_files) {
+    for subagents_dir in derive_subagent_dirs(agent_files) {
         if watched_dirs.insert(subagents_dir.clone()) {
             watcher.watch(&subagents_dir, RecursiveMode::NonRecursive)?;
         }
@@ -135,7 +150,6 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
 
-    // Build path -> index lookup (mutable for dynamic additions)
     let mut path_to_idx: HashMap<PathBuf, usize> = agent_files
         .iter()
         .enumerate()
@@ -154,13 +168,12 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                     if path_to_idx.contains_key(&jsonl) {
                         continue;
                     }
-                    // Watch the new JSONL's directory
                     if let Some(dir) = jsonl.parent() {
                         if watched_dirs.insert(dir.to_path_buf()) {
                             let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
                         }
                     }
-                    let name = unique_name(&name, &agent_files);
+                    let name = unique_name(&name, agent_files);
                     let color = Some(color_for_name(&name));
                     let idx = agent_files.len();
                     agent_files.push(AgentFile {
@@ -182,7 +195,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                 if !matches_filter(&entry.message_type, &opts.type_filter) {
                     continue;
                 }
-                print_entry(&entry, &opts, max_name_width);
+                print_entry(&entry, opts, max_name_width);
             }
         } else if changed_path.extension().is_some_and(|e| e == "jsonl")
             && changed_path.is_file()
@@ -190,7 +203,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         {
             // New subagent JSONL detected -- register it dynamically
             let (base_name, _) = resolve_subagent_info(&changed_path);
-            let name = unique_name(&base_name, &agent_files);
+            let name = unique_name(&base_name, agent_files);
             let color = Some(color_for_name(&name));
             let idx = agent_files.len();
             agent_files.push(AgentFile {
