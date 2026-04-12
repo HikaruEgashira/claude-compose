@@ -9,6 +9,5 @@ pub use team::{
     read_subagent_name,
 };
 
-// Re-exported for use in tests (e.g. format.rs ps tests).
 #[cfg(test)]
 pub use team::MemberInfo;
