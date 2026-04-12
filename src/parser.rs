@@ -14,6 +14,36 @@ pub struct LogEntry {
     pub is_error: bool,
 }
 
+impl LogEntry {
+    fn new(
+        timestamp: &str,
+        agent_name: &str,
+        agent_color: Option<&str>,
+        message_type: EntryType,
+        content: String,
+    ) -> Self {
+        Self {
+            timestamp: timestamp.to_string(),
+            agent_name: agent_name.to_string(),
+            agent_color: agent_color.map(String::from),
+            message_type,
+            content,
+            tool_name: None,
+            is_error: false,
+        }
+    }
+
+    fn with_tool(mut self, name: &str) -> Self {
+        self.tool_name = Some(name.to_string());
+        self
+    }
+
+    fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = is_error;
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum EntryType {
     Assistant,
@@ -100,15 +130,13 @@ fn parse_assistant(
             "text" => {
                 let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 if !text.is_empty() {
-                    entries.push(LogEntry {
-                        timestamp: timestamp.to_string(),
-                        agent_name: agent_name.to_string(),
-                        agent_color: agent_color.map(String::from),
-                        message_type: EntryType::Assistant,
-                        content: text.to_string(),
-                        tool_name: None,
-                        is_error: false,
-                    });
+                    entries.push(LogEntry::new(
+                        timestamp,
+                        agent_name,
+                        agent_color,
+                        EntryType::Assistant,
+                        text.to_string(),
+                    ));
                 }
             }
             "tool_use" => {
@@ -117,15 +145,16 @@ fn parse_assistant(
                     .and_then(|n| n.as_str())
                     .unwrap_or("unknown");
                 let content = extract_tool_use_summary(name, block);
-                entries.push(LogEntry {
-                    timestamp: timestamp.to_string(),
-                    agent_name: agent_name.to_string(),
-                    agent_color: agent_color.map(String::from),
-                    message_type: EntryType::ToolUse,
-                    content,
-                    tool_name: Some(name.to_string()),
-                    is_error: false,
-                });
+                entries.push(
+                    LogEntry::new(
+                        timestamp,
+                        agent_name,
+                        agent_color,
+                        EntryType::ToolUse,
+                        content,
+                    )
+                    .with_tool(name),
+                );
             }
             "thinking" => {}
             _ => {}
@@ -189,22 +218,23 @@ fn parse_user(
     agent_name: &str,
     agent_color: Option<&str>,
 ) -> Vec<LogEntry> {
-    let content = &v["message"]["content"];
+    let content = match v.pointer("/message/content") {
+        Some(c) => c,
+        None => return vec![],
+    };
 
     match content {
         Value::String(s) => {
             if s.is_empty() {
                 return vec![];
             }
-            vec![LogEntry {
-                timestamp: timestamp.to_string(),
-                agent_name: agent_name.to_string(),
-                agent_color: agent_color.map(String::from),
-                message_type: EntryType::User,
-                content: s.clone(),
-                tool_name: None,
-                is_error: false,
-            }]
+            vec![LogEntry::new(
+                timestamp,
+                agent_name,
+                agent_color,
+                EntryType::User,
+                s.clone(),
+            )]
         }
         Value::Array(arr) => {
             let mut entries = Vec::new();
@@ -216,27 +246,26 @@ fn parse_user(
                         .and_then(|e| e.as_bool())
                         .unwrap_or(false);
                     let result_content = extract_tool_result_content(block);
-                    entries.push(LogEntry {
-                        timestamp: timestamp.to_string(),
-                        agent_name: agent_name.to_string(),
-                        agent_color: agent_color.map(String::from),
-                        message_type: EntryType::ToolResult,
-                        content: result_content,
-                        tool_name: None,
-                        is_error,
-                    });
+                    entries.push(
+                        LogEntry::new(
+                            timestamp,
+                            agent_name,
+                            agent_color,
+                            EntryType::ToolResult,
+                            result_content,
+                        )
+                        .with_error(is_error),
+                    );
                 } else if block_type == "text" {
                     let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     if !text.is_empty() {
-                        entries.push(LogEntry {
-                            timestamp: timestamp.to_string(),
-                            agent_name: agent_name.to_string(),
-                            agent_color: agent_color.map(String::from),
-                            message_type: EntryType::User,
-                            content: text.to_string(),
-                            tool_name: None,
-                            is_error: false,
-                        });
+                        entries.push(LogEntry::new(
+                            timestamp,
+                            agent_name,
+                            agent_color,
+                            EntryType::User,
+                            text.to_string(),
+                        ));
                     }
                 }
             }
@@ -265,15 +294,13 @@ fn parse_system(
         format!("[system:{subtype}]")
     };
 
-    vec![LogEntry {
-        timestamp: timestamp.to_string(),
-        agent_name: agent_name.to_string(),
-        agent_color: agent_color.map(String::from),
-        message_type: EntryType::System,
-        content: display,
-        tool_name: None,
-        is_error: false,
-    }]
+    vec![LogEntry::new(
+        timestamp,
+        agent_name,
+        agent_color,
+        EntryType::System,
+        display,
+    )]
 }
 
 fn extract_tool_result_content(block: &Value) -> String {
