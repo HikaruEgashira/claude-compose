@@ -324,17 +324,7 @@ fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
     deduplicate_names(&mut files);
 
     // Exclude own session to prevent feedback loop
-    let own_ids = find_own_session_ids();
-    if !own_ids.is_empty() {
-        files.retain(|af| {
-            let stem = af
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            !own_ids.contains(&stem)
-        });
-    }
+    exclude_own_sessions(&mut files);
 
     Ok(files)
 }
@@ -502,17 +492,7 @@ fn discover_team_files(config: &TeamConfig) -> anyhow::Result<Vec<AgentFile>> {
     //    When claude-compose runs inside a Claude Code session, its stdout
     //    is captured as tool_result in the session's JSONL. Watching that
     //    file creates an infinite read-print-write cycle.
-    let own_ids = find_own_session_ids();
-    if !own_ids.is_empty() {
-        files.retain(|af| {
-            let stem = af
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            !own_ids.contains(&stem)
-        });
-    }
+    exclude_own_sessions(&mut files);
 
     Ok(files)
 }
@@ -710,6 +690,22 @@ fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
             "{}",
             format_entry(entry, opts.verbose, opts.no_color, max_name_width)
         );
+    }
+}
+
+/// Remove any AgentFiles whose session ID matches the current process's
+/// ancestor chain to prevent feedback loops.
+fn exclude_own_sessions(files: &mut Vec<AgentFile>) {
+    let own_ids = find_own_session_ids();
+    if !own_ids.is_empty() {
+        files.retain(|af| {
+            let stem = af
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            !own_ids.contains(&stem)
+        });
     }
 }
 
