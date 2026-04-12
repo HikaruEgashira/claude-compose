@@ -434,20 +434,12 @@ mod tests {
                 color: None,
                 is_active: true,
                 tmux_pane_id: None,
-                agent_id: None,
-                model: None,
-                cwd: None,
-                backend_type: None,
             },
             MemberInfo {
                 name: "agent-b".to_string(),
                 color: None,
                 is_active: false,
                 tmux_pane_id: None,
-                agent_id: None,
-                model: None,
-                cwd: None,
-                backend_type: None,
             },
         ];
 

@@ -73,16 +73,16 @@ pub struct PsOpts {
 
 #[derive(clap::Args)]
 pub struct UpOpts {
-    /// Team name (auto-detect if omitted)
-    #[arg(long)]
-    pub team: Option<String>,
+    /// Project directory (default: current directory)
+    #[arg(default_value = ".")]
+    pub path: String,
 }
 
 #[derive(clap::Args)]
 pub struct DownOpts {
-    /// Team name (auto-detect if omitted)
-    #[arg(long)]
-    pub team: Option<String>,
+    /// Project directory (default: current directory)
+    #[arg(default_value = ".")]
+    pub path: String,
 }
 
 #[derive(Clone, ValueEnum)]

@@ -37,10 +37,6 @@ pub struct MemberInfo {
     pub color: Option<String>,
     pub is_active: bool,
     pub tmux_pane_id: Option<String>,
-    pub agent_id: Option<String>,
-    pub model: Option<String>,
-    pub cwd: Option<String>,
-    pub backend_type: Option<String>,
 }
 
 /// Parse a single JSONL line into zero or more LogEntry values.
@@ -333,14 +329,6 @@ pub fn find_teams() -> Vec<String> {
         .collect()
 }
 
-/// Path to a team's config.json.
-pub fn team_config_path(team_name: &str) -> anyhow::Result<PathBuf> {
-    Ok(claude_home()?
-        .join("teams")
-        .join(team_name)
-        .join("config.json"))
-}
-
 /// Load team config from ~/.claude/teams/{team_name}/config.json
 pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
     let path = claude_home()?
@@ -393,22 +381,6 @@ pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
                             .and_then(|a| a.as_bool())
                             .unwrap_or(false),
                         tmux_pane_id: pane_id,
-                        agent_id: m
-                            .get("agentId")
-                            .and_then(|a| a.as_str())
-                            .map(String::from),
-                        model: m
-                            .get("model")
-                            .and_then(|m| m.as_str())
-                            .map(String::from),
-                        cwd: m
-                            .get("cwd")
-                            .and_then(|c| c.as_str())
-                            .map(String::from),
-                        backend_type: m
-                            .get("backendType")
-                            .and_then(|b| b.as_str())
-                            .map(String::from),
                     }
                 })
                 .collect()
