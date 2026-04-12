@@ -38,7 +38,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         files
     } else {
         let files = discover_all_sessions()?;
-        if files.is_empty() {
+        if files.is_empty() && !opts.follow {
             anyhow::bail!(
                 "No active sessions found in ~/.claude/sessions/. \
                  Start a Claude Code session first, or specify --team."
@@ -121,6 +121,22 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         }
     }
 
+    // Watch ~/.claude/sessions/ to discover new sessions dynamically
+    let claude = claude_home()?;
+    let sessions_dir = claude.join("sessions");
+    if sessions_dir.is_dir() {
+        if watched_dirs.insert(sessions_dir.clone()) {
+            watcher.watch(&sessions_dir, RecursiveMode::NonRecursive)?;
+        }
+    }
+
+    let own_ids = find_own_session_ids();
+    let mut seen_session_ids: std::collections::HashSet<String> = agent_files
+        .iter()
+        .filter_map(|af| af.path.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+
     // Build path -> index lookup (mutable for dynamic additions)
     let mut path_to_idx: HashMap<PathBuf, usize> = agent_files
         .iter()
@@ -129,6 +145,39 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         .collect();
 
     while let Some(changed_path) = rx.recv().await {
+        // New session PID file in ~/.claude/sessions/
+        if changed_path.parent() == Some(sessions_dir.as_ref())
+            && changed_path.extension().is_some_and(|e| e == "json")
+        {
+            if let Some(new_files) = try_register_session(
+                &changed_path,
+                &claude,
+                &own_ids,
+                &mut seen_session_ids,
+            ) {
+                for (jsonl, name, color) in new_files {
+                    if path_to_idx.contains_key(&jsonl) {
+                        continue;
+                    }
+                    // Watch the new JSONL's directory
+                    if let Some(dir) = jsonl.parent() {
+                        if watched_dirs.insert(dir.to_path_buf()) {
+                            let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
+                        }
+                    }
+                    let idx = agent_files.len();
+                    agent_files.push(AgentFile {
+                        path: jsonl.clone(),
+                        agent_name: name,
+                        agent_color: color,
+                        offset: 0,
+                    });
+                    path_to_idx.insert(jsonl, idx);
+                }
+            }
+            continue;
+        }
+
         if let Some(&idx) = path_to_idx.get(&changed_path) {
             let af = &mut agent_files[idx];
             let new_entries = read_new_lines(af)?;
@@ -166,6 +215,75 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Try to register a newly appeared session PID file.
+/// Returns a list of (jsonl_path, agent_name, color) for the session and its subagents,
+/// or None if the file is not a valid/relevant session.
+fn try_register_session(
+    pid_file: &std::path::Path,
+    claude_dir: &std::path::Path,
+    own_ids: &[String],
+    seen_session_ids: &mut std::collections::HashSet<String>,
+) -> Option<Vec<(PathBuf, String, Option<String>)>> {
+    let stem = pid_file.file_stem()?.to_str()?;
+    let pid: u32 = stem.parse().ok()?;
+
+    if !is_process_alive(pid) {
+        return None;
+    }
+
+    let info = read_session_file(pid_file)?;
+
+    if own_ids.contains(&info.session_id) {
+        return None;
+    }
+
+    if !seen_session_ids.insert(info.session_id.clone()) {
+        return None;
+    }
+
+    let project_key = cwd_to_project_key(&info.cwd);
+    let project_dir = claude_dir.join("projects").join(&project_key);
+    let jsonl = project_dir.join(format!("{}.jsonl", info.session_id));
+    if !jsonl.is_file() {
+        return None;
+    }
+
+    let mut results = Vec::new();
+
+    let short_id = &info.session_id[..info.session_id.len().min(8)];
+    let name = info
+        .agent_name
+        .unwrap_or_else(|| format!("session-{short_id}"));
+    let color = Some(color_for_name(&name));
+    results.push((jsonl, name, color));
+
+    // Subagent JSONLs
+    let subagents_dir = project_dir.join(&info.session_id).join("subagents");
+    if subagents_dir.is_dir() {
+        if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
+            for sub_entry in sub_entries.flatten() {
+                let sub_path = sub_entry.path();
+                if sub_path.extension().is_some_and(|e| e == "jsonl") {
+                    let meta_path = sub_path.with_extension("meta.json");
+                    let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
+                        sub_path
+                            .file_stem()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .strip_prefix("agent-")
+                            .unwrap_or("unknown")
+                            .to_string()
+                    });
+                    let sub_color = Some(color_for_name(&sub_name));
+                    results.push((sub_path, sub_name, sub_color));
+                }
+            }
+        }
+    }
+
+    Some(results)
 }
 
 /// Discover all active Claude Code sessions from ~/.claude/sessions/.
