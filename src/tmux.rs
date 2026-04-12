@@ -49,6 +49,34 @@ pub fn run_up(opts: UpOpts) -> anyhow::Result<()> {
         );
     }
 
+    // Split right pane (30% width) for logs -f
+    let split = Command::new("tmux")
+        .args([
+            "split-window",
+            "-h",
+            "-t",
+            &session,
+            "-l",
+            "30%",
+            "-c",
+            &abs.to_string_lossy(),
+            "claude-compose",
+            "logs",
+            "-f",
+        ])
+        .output()?;
+    if !split.status.success() {
+        anyhow::bail!(
+            "tmux split-window failed: {}",
+            String::from_utf8_lossy(&split.stderr)
+        );
+    }
+
+    // Focus back to the left pane (claude)
+    let _ = Command::new("tmux")
+        .args(["select-pane", "-t", &format!("{session}:.0")])
+        .output();
+
     let status = Command::new("tmux")
         .args(["attach", "-t", &session])
         .status()?;
