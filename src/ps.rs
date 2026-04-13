@@ -83,6 +83,7 @@ fn print_ps_json(teams: &[String], explicit_team: bool) -> anyhow::Result<()> {
                 if explicit_team {
                     anyhow::bail!("team '{team_name}' not found: {e}");
                 }
+                eprintln!("Warning: skipping team '{team_name}': {e}");
                 continue;
             }
         };
