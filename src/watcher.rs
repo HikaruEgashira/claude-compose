@@ -9,9 +9,9 @@ use tokio::sync::mpsc;
 use crate::cli::{LogsOpts, MessageType};
 use crate::format::{format_entry, format_entry_json};
 use crate::parser::{
-    claude_home, cwd_to_project_key, discover_member_sessions, load_team_config, parse_line,
-    project_log_dir, read_subagent_name, resolve_member_session_via_tmux, EntryType, LogEntry,
-    TeamConfig,
+    EntryType, LogEntry, TeamConfig, claude_home, cwd_to_project_key, discover_member_sessions,
+    load_team_config, parse_line, project_log_dir, read_subagent_name,
+    resolve_member_session_via_tmux,
 };
 
 pub struct AgentFile {
@@ -25,6 +25,19 @@ pub struct AgentFile {
 }
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
+    let mut agent_files = discover_files(&opts)?;
+    let max_name_width = tail_entries(&mut agent_files, &opts)?;
+
+    if opts.follow {
+        follow_events(&mut agent_files, &opts, max_name_width).await?;
+    }
+
+    Ok(())
+}
+
+/// Discover agent log files based on --team flag or auto-detection.
+/// Applies the agent name filter if specified.
+fn discover_files(opts: &LogsOpts) -> anyhow::Result<Vec<AgentFile>> {
     let mut agent_files = if let Some(ref team_name) = opts.team {
         let config = load_team_config(team_name)?;
         let files = discover_team_files(&config)?;
@@ -47,7 +60,6 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         files
     };
 
-    // Apply agent name filter
     if !opts.agents.is_empty() {
         agent_files.retain(|af| {
             opts.agents
@@ -59,6 +71,12 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         }
     }
 
+    Ok(agent_files)
+}
+
+/// Read existing log entries from all agent files, apply tail limit, and print.
+/// Returns the computed max_name_width for consistent formatting in follow mode.
+fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Result<usize> {
     let max_name_width = agent_files
         .iter()
         .map(|af| af.agent_name.len())
@@ -66,32 +84,29 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         .unwrap_or(10)
         .max(10);
 
-    // Read existing content (tail)
     let mut all_entries: Vec<LogEntry> = Vec::new();
-    for af in &mut agent_files {
-        let entries = read_file_entries(af)?;
-        all_entries.extend(entries);
+    for af in agent_files.iter_mut() {
+        all_entries.extend(read_file_entries(af)?);
     }
 
-    // Sort by timestamp
     all_entries.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
 
-    // Apply tail limit
     let start = all_entries.len().saturating_sub(opts.tail);
-    let tail_entries = &all_entries[start..];
-
-    for entry in tail_entries {
-        if !matches_filter(&entry.message_type, &opts.type_filter) {
-            continue;
+    for entry in &all_entries[start..] {
+        if matches_filter(&entry.message_type, &opts.type_filter) {
+            print_entry(entry, opts, max_name_width);
         }
-        print_entry(entry, &opts, max_name_width);
     }
 
-    if !opts.follow {
-        return Ok(());
-    }
+    Ok(max_name_width)
+}
 
-    // Follow mode: watch for file changes using notify
+/// Watch for file changes and stream new log entries in real time.
+async fn follow_events(
+    agent_files: &mut Vec<AgentFile>,
+    opts: &LogsOpts,
+    max_name_width: usize,
+) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
     let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
@@ -106,7 +121,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
 
     // Watch directories containing our log files
     let mut watched_dirs = std::collections::HashSet::new();
-    for af in &agent_files {
+    for af in agent_files.iter() {
         if let Some(dir) = af.path.parent() {
             if watched_dirs.insert(dir.to_path_buf()) {
                 watcher.watch(dir, RecursiveMode::NonRecursive)?;
@@ -115,7 +130,7 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     }
 
     // Also watch subagent directories for dynamically spawned agents
-    for subagents_dir in derive_subagent_dirs(&agent_files) {
+    for subagents_dir in derive_subagent_dirs(agent_files) {
         if watched_dirs.insert(subagents_dir.clone()) {
             watcher.watch(&subagents_dir, RecursiveMode::NonRecursive)?;
         }
@@ -135,7 +150,6 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         .map(|s| s.to_string_lossy().into_owned())
         .collect();
 
-    // Build path -> index lookup (mutable for dynamic additions)
     let mut path_to_idx: HashMap<PathBuf, usize> = agent_files
         .iter()
         .enumerate()
@@ -147,23 +161,19 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
         if changed_path.parent() == Some(sessions_dir.as_ref())
             && changed_path.extension().is_some_and(|e| e == "json")
         {
-            if let Some(new_files) = try_register_session(
-                &changed_path,
-                &claude,
-                &own_ids,
-                &mut seen_session_ids,
-            ) {
+            if let Some(new_files) =
+                try_register_session(&changed_path, &claude, &own_ids, &mut seen_session_ids)
+            {
                 for (jsonl, name, _) in new_files {
                     if path_to_idx.contains_key(&jsonl) {
                         continue;
                     }
-                    // Watch the new JSONL's directory
                     if let Some(dir) = jsonl.parent() {
                         if watched_dirs.insert(dir.to_path_buf()) {
                             let _ = watcher.watch(dir, RecursiveMode::NonRecursive);
                         }
                     }
-                    let name = unique_name(&name, &agent_files);
+                    let name = unique_name(&name, agent_files);
                     let color = Some(color_for_name(&name));
                     let idx = agent_files.len();
                     agent_files.push(AgentFile {
@@ -185,24 +195,15 @@ pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
                 if !matches_filter(&entry.message_type, &opts.type_filter) {
                     continue;
                 }
-                print_entry(&entry, &opts, max_name_width);
+                print_entry(&entry, opts, max_name_width);
             }
         } else if changed_path.extension().is_some_and(|e| e == "jsonl")
             && changed_path.is_file()
             && !path_to_idx.contains_key(&changed_path)
         {
             // New subagent JSONL detected -- register it dynamically
-            let meta_path = changed_path.with_extension("meta.json");
-            let base_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                changed_path
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .strip_prefix("agent-")
-                    .unwrap_or("unknown")
-                    .to_string()
-            });
-            let name = unique_name(&base_name, &agent_files);
+            let (base_name, _) = resolve_subagent_info(&changed_path);
+            let name = unique_name(&base_name, agent_files);
             let color = Some(color_for_name(&name));
             let idx = agent_files.len();
             agent_files.push(AgentFile {
@@ -261,26 +262,8 @@ fn try_register_session(
 
     // Subagent JSONLs
     let subagents_dir = project_dir.join(&info.session_id).join("subagents");
-    if subagents_dir.is_dir() {
-        if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
-            for sub_entry in sub_entries.flatten() {
-                let sub_path = sub_entry.path();
-                if sub_path.extension().is_some_and(|e| e == "jsonl") {
-                    let meta_path = sub_path.with_extension("meta.json");
-                    let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                        sub_path
-                            .file_stem()
-                            .unwrap_or_default()
-                            .to_string_lossy()
-                            .strip_prefix("agent-")
-                            .unwrap_or("unknown")
-                            .to_string()
-                    });
-                    let sub_color = Some(color_for_name(&sub_name));
-                    results.push((sub_path, sub_name, sub_color));
-                }
-            }
-        }
+    for af in scan_subagent_dir(&subagents_dir) {
+        results.push((af.path, af.agent_name, af.agent_color));
     }
 
     Some(results)
@@ -345,51 +328,16 @@ fn discover_all_sessions() -> anyhow::Result<Vec<AgentFile>> {
             offset: 0,
         });
 
-        // Subagent JONLs within the session directory
+        // Subagent JSONLs within the session directory
         let subagents_dir = project_dir.join(&info.session_id).join("subagents");
-        if subagents_dir.is_dir() {
-            if let Ok(sub_entries) = fs::read_dir(&subagents_dir) {
-                for sub_entry in sub_entries.flatten() {
-                    let sub_path = sub_entry.path();
-                    if sub_path.extension().is_some_and(|e| e == "jsonl") {
-                        let meta_path = sub_path.with_extension("meta.json");
-                        let sub_name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                            sub_path
-                                .file_stem()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .strip_prefix("agent-")
-                                .unwrap_or("unknown")
-                                .to_string()
-                        });
-                        let sub_color = Some(color_for_name(&sub_name));
-                        files.push(AgentFile {
-                            path: sub_path,
-                            agent_name: sub_name,
-                            agent_color: sub_color,
-                            offset: 0,
-                        });
-                    }
-                }
-            }
-        }
+        files.extend(scan_subagent_dir(&subagents_dir));
     }
 
     // Deduplicate names (e.g. two sessions in the same project dir)
     deduplicate_names(&mut files);
 
     // Exclude own session to prevent feedback loop
-    let own_ids = find_own_session_ids();
-    if !own_ids.is_empty() {
-        files.retain(|af| {
-            let stem = af
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            !own_ids.contains(&stem)
-        });
-    }
+    exclude_own_sessions(&mut files);
 
     Ok(files)
 }
@@ -427,6 +375,48 @@ fn is_process_alive(pid: u32) -> bool {
         .stderr(std::process::Stdio::null())
         .output()
         .is_ok_and(|o| o.status.success())
+}
+
+/// Resolve a subagent's display name and color from its JSONL path.
+/// Reads the companion `.meta.json` if it exists; falls back to stripping
+/// the `agent-` prefix from the file stem.
+fn resolve_subagent_info(jsonl_path: &std::path::Path) -> (String, Option<String>) {
+    let meta_path = jsonl_path.with_extension("meta.json");
+    let name = read_subagent_name(&meta_path).unwrap_or_else(|| {
+        jsonl_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .strip_prefix("agent-")
+            .unwrap_or("unknown")
+            .to_string()
+    });
+    let color = Some(color_for_name(&name));
+    (name, color)
+}
+
+/// Scan a subagents directory and return AgentFile entries for each .jsonl found.
+fn scan_subagent_dir(subagents_dir: &std::path::Path) -> Vec<AgentFile> {
+    let mut files = Vec::new();
+    if !subagents_dir.is_dir() {
+        return files;
+    }
+    let Ok(entries) = fs::read_dir(subagents_dir) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|e| e == "jsonl") {
+            let (name, color) = resolve_subagent_info(&path);
+            files.push(AgentFile {
+                path,
+                agent_name: name,
+                agent_color: color,
+                offset: 0,
+            });
+        }
+    }
+    files
 }
 
 /// Derive subagent directories from discovered AgentFile paths.
@@ -490,33 +480,7 @@ fn discover_team_files(config: &TeamConfig) -> anyhow::Result<Vec<AgentFile>> {
 
     // 2. Subagent JSONLs within the lead session directory
     let subagents_dir = project_dir.join(session_id).join("subagents");
-    if subagents_dir.is_dir()
-        && let Ok(entries) = fs::read_dir(&subagents_dir)
-    {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().is_some_and(|e| e == "jsonl") {
-                let meta_path = path.with_extension("meta.json");
-                let name = read_subagent_name(&meta_path).unwrap_or_else(|| {
-                    path.file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .strip_prefix("agent-")
-                        .unwrap_or("unknown")
-                        .to_string()
-                });
-
-                let color = Some(color_for_name(&name));
-
-                files.push(AgentFile {
-                    path,
-                    agent_name: name,
-                    agent_color: color,
-                    offset: 0,
-                });
-            }
-        }
-    }
+    files.extend(scan_subagent_dir(&subagents_dir));
 
     // 3. Team member sessions (tmux-based members with independent JSONL files)
     let known_sessions = collect_known_sessions(&files);
@@ -541,17 +505,7 @@ fn discover_team_files(config: &TeamConfig) -> anyhow::Result<Vec<AgentFile>> {
     //    When claude-compose runs inside a Claude Code session, its stdout
     //    is captured as tool_result in the session's JSONL. Watching that
     //    file creates an infinite read-print-write cycle.
-    let own_ids = find_own_session_ids();
-    if !own_ids.is_empty() {
-        files.retain(|af| {
-            let stem = af
-                .path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            !own_ids.contains(&stem)
-        });
-    }
+    exclude_own_sessions(&mut files);
 
     Ok(files)
 }
@@ -597,7 +551,7 @@ fn read_new_lines(af: &mut AgentFile) -> anyhow::Result<Vec<LogEntry>> {
 
     // Find the last newline — everything after it is an incomplete line
     let consumed = match raw.iter().rposition(|&b| b == b'\n') {
-        Some(pos) => pos + 1, // include the newline
+        Some(pos) => pos + 1,      // include the newline
         None => return Ok(vec![]), // no complete line yet
     };
 
@@ -752,6 +706,22 @@ fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
     }
 }
 
+/// Remove any AgentFiles whose session ID matches the current process's
+/// ancestor chain to prevent feedback loops.
+fn exclude_own_sessions(files: &mut Vec<AgentFile>) {
+    let own_ids = find_own_session_ids();
+    if !own_ids.is_empty() {
+        files.retain(|af| {
+            let stem = af
+                .path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            !own_ids.contains(&stem)
+        });
+    }
+}
+
 /// Detect session IDs belonging to the current process's ancestor chain.
 ///
 /// Claude Code stores session metadata at ~/.claude/sessions/{PID}.json.
@@ -794,10 +764,7 @@ fn parent_pid(pid: u32) -> Option<u32> {
         .args(["-o", "ppid=", "-p", &pid.to_string()])
         .output()
         .ok()?;
-    String::from_utf8_lossy(&output.stdout)
-        .trim()
-        .parse()
-        .ok()
+    String::from_utf8_lossy(&output.stdout).trim().parse().ok()
 }
 
 #[cfg(test)]
@@ -962,12 +929,18 @@ mod tests {
 
     #[test]
     fn session_display_name_fallback_on_empty_cwd() {
-        assert_eq!(session_display_name("", "abc12345-long-id"), "session-abc12345");
+        assert_eq!(
+            session_display_name("", "abc12345-long-id"),
+            "session-abc12345"
+        );
     }
 
     #[test]
     fn session_display_name_root_path() {
-        assert_eq!(session_display_name("/", "abc12345-long-id"), "session-abc12345");
+        assert_eq!(
+            session_display_name("/", "abc12345-long-id"),
+            "session-abc12345"
+        );
     }
 
     fn make_agent_file(name: &str) -> AgentFile {

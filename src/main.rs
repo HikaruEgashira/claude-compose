@@ -1,6 +1,7 @@
 mod cli;
 mod format;
 mod parser;
+mod ps;
 mod tmux;
 mod watcher;
 
@@ -15,7 +16,7 @@ async fn main() -> anyhow::Result<()> {
             watcher::run(opts).await?;
         }
         Command::Ps(opts) => {
-            format::print_ps(opts)?;
+            ps::run(opts)?;
         }
         Command::Up(opts) => {
             tmux::run_up(opts)?;
