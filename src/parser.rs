@@ -62,6 +62,14 @@ pub fn parse_line(line: &str, agent_name: &str, agent_color: Option<&str>) -> Ve
     }
 }
 
+/// Truncate a string to at most `max` characters (not bytes).
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
+}
+
 /// Format a raw ISO 8601 timestamp to HH:MM:SS for display.
 pub fn format_timestamp(raw: &str) -> String {
     // "2026-04-12T12:57:14.123Z" → "12:57:14"
@@ -156,8 +164,7 @@ fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String {
         }
         "Bash" => {
             let cmd = input.get("command").and_then(|v| v.as_str()).unwrap_or("");
-            let short = if cmd.len() > 80 { &cmd[..80] } else { cmd };
-            short.to_string()
+            truncate_chars(cmd, 80)
         }
         "Read" | "Write" | "Edit" => {
             let path = input.get("file_path").and_then(|v| v.as_str()).unwrap_or("");
