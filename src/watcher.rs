@@ -109,15 +109,23 @@ async fn follow_events(
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, _>| {
-        if let Ok(event) = res {
-            if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
-                for path in event.paths {
-                    let _ = tx.blocking_send(path);
+    let mut watcher = notify::recommended_watcher({
+        let tx = tx.clone();
+        move |res: Result<Event, _>| match res {
+            Ok(event) => {
+                if matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_)) {
+                    for path in event.paths {
+                        let _ = tx.blocking_send(path);
+                    }
                 }
+            }
+            Err(e) => {
+                eprintln!("[claude-compose] watcher error: {e}");
             }
         }
     })?;
+    // Drop the original sender so the channel closes only when the watcher's clone is dropped.
+    drop(tx);
 
     // Watch directories containing our log files
     let mut watched_dirs = std::collections::HashSet::new();
@@ -156,7 +164,10 @@ async fn follow_events(
         .map(|(i, af)| (af.path.clone(), i))
         .collect();
 
-    while let Some(changed_path) = rx.recv().await {
+    loop {
+        let Some(changed_path) = rx.recv().await else {
+            anyhow::bail!("file watcher stopped unexpectedly");
+        };
         // New session PID file in ~/.claude/sessions/
         if changed_path.parent() == Some(sessions_dir.as_ref())
             && changed_path.extension().is_some_and(|e| e == "json")
@@ -215,8 +226,6 @@ async fn follow_events(
             path_to_idx.insert(changed_path, idx);
         }
     }
-
-    Ok(())
 }
 
 /// Try to register a newly appeared session PID file.
