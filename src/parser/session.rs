@@ -52,7 +52,7 @@ pub fn resolve_member_session_via_tmux(pane_id: &str) -> Option<String> {
 }
 
 /// Discover member session IDs by scanning JSONL files in the project directory.
-/// Reads the first 2 lines of each JSONL to find teamName and agentName.
+/// Reads the first 5 lines of each JSONL to find teamName and agentName.
 pub fn discover_member_sessions(
     project_dir: &std::path::Path,
     team_name: &str,

@@ -80,6 +80,7 @@ pub fn load_team_config(team_name: &str) -> anyhow::Result<TeamConfig> {
         .and_then(|arr| arr.first())
         .and_then(|m| m.get("cwd"))
         .and_then(|c| c.as_str())
+        .or_else(|| v.get("cwd").and_then(|c| c.as_str()))
         .unwrap_or("")
         .to_string();
 
