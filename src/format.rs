@@ -20,8 +20,16 @@ pub fn format_entry(
 
     let content = format_content(entry, verbose, no_color);
 
+    // Use a branch-style separator for sidechain (subagent/Task-tool) entries
+    // so they are visually indented from the main conversation stream.
+    let (sep_color, sep_no_color) = if entry.is_sidechain {
+        ("╰─", ">-")
+    } else {
+        ("│", "|")
+    };
+
     if no_color {
-        return format!("{timestamp} {name}| {content}");
+        return format!("{timestamp} {name}{sep_no_color} {content}");
     }
 
     let color = resolve_color(entry.agent_color.as_deref());
@@ -33,7 +41,7 @@ pub fn format_entry(
         render_inline_bold(&content)
     };
 
-    format!("{timestamp} {styled_name}│ {styled_content}")
+    format!("{timestamp} {styled_name}{sep_color} {styled_content}")
 }
 
 fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
@@ -234,6 +242,7 @@ mod tests {
             content: content.to_string(),
             tool_name: None,
             is_error: false,
+            is_sidechain: false,
         }
     }
 
@@ -436,5 +445,35 @@ mod tests {
         let entry = make_entry(EntryType::Snapshot, "[git snapshot]");
         let output = format_entry(&entry, false, true, 10);
         assert!(output.contains("[snapshot]"));
+    }
+
+    #[test]
+    fn test_format_entry_sidechain_separator() {
+        let mut entry = make_entry(EntryType::Assistant, "subagent text");
+        entry.is_sidechain = true;
+        let output = format_entry(&entry, false, true, 10);
+        assert!(
+            output.contains(">-"),
+            "expected sidechain ASCII separator '>-' in {output:?}"
+        );
+        assert!(
+            !output.contains('|'),
+            "regular '|' separator must not appear for sidechain entries: {output:?}"
+        );
+        assert!(output.contains("subagent text"));
+    }
+
+    #[test]
+    fn test_format_entry_regular_separator() {
+        let entry = make_entry(EntryType::Assistant, "main text");
+        let output = format_entry(&entry, false, true, 10);
+        assert!(
+            output.contains('|'),
+            "regular entry should use '|' separator: {output:?}"
+        );
+        assert!(
+            !output.contains(">-"),
+            "regular entry must not use sidechain separator: {output:?}"
+        );
     }
 }

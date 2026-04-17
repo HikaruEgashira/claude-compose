@@ -10,9 +10,16 @@ pub struct LogEntry {
     pub content: String,
     pub tool_name: Option<String>,
     pub is_error: bool,
+    /// True when the underlying JSONL entry had `"isSidechain": true`
+    /// (e.g. subagent/Task-tool output emitted inline in the parent log).
+    /// Defaults to false for regular conversation entries.
+    #[serde(default)]
+    pub is_sidechain: bool,
 }
 
 impl LogEntry {
+    /// Construct a new LogEntry. `is_sidechain` defaults to false; use
+    /// [`LogEntry::with_sidechain`] to flip it after construction.
     fn new(
         timestamp: &str,
         agent_name: &str,
@@ -28,6 +35,7 @@ impl LogEntry {
             content,
             tool_name: None,
             is_error: false,
+            is_sidechain: false,
         }
     }
 
@@ -38,6 +46,11 @@ impl LogEntry {
 
     fn with_error(mut self, is_error: bool) -> Self {
         self.is_error = is_error;
+        self
+    }
+
+    fn with_sidechain(mut self, is_sidechain: bool) -> Self {
+        self.is_sidechain = is_sidechain;
         self
     }
 }
@@ -70,13 +83,24 @@ pub fn parse_line(line: &str, agent_name: &str, agent_color: Option<&str>) -> Ve
 
     let top_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+    // Claude Code marks subagent (Task-tool) entries inline in the parent
+    // JSONL with a top-level `isSidechain: true` flag. We propagate this to
+    // every LogEntry produced so downstream filters / renderers can treat
+    // sidechain traffic distinctly.
+    let is_sidechain = v
+        .get("isSidechain")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+
     match top_type {
-        "assistant" => parse_assistant(&v, &timestamp, agent_name, agent_color),
-        "user" => parse_user(&v, &timestamp, agent_name, agent_color),
-        "system" => parse_system(&v, &timestamp, agent_name, agent_color),
-        "summary" => parse_summary(&v, &timestamp, agent_name, agent_color),
-        "result" => parse_result(&v, &timestamp, agent_name, agent_color),
-        "file-history-snapshot" => parse_snapshot(&v, &timestamp, agent_name, agent_color),
+        "assistant" => parse_assistant(&v, &timestamp, agent_name, agent_color, is_sidechain),
+        "user" => parse_user(&v, &timestamp, agent_name, agent_color, is_sidechain),
+        "system" => parse_system(&v, &timestamp, agent_name, agent_color, is_sidechain),
+        "summary" => parse_summary(&v, &timestamp, agent_name, agent_color, is_sidechain),
+        "result" => parse_result(&v, &timestamp, agent_name, agent_color, is_sidechain),
+        "file-history-snapshot" => {
+            parse_snapshot(&v, &timestamp, agent_name, agent_color, is_sidechain)
+        }
         _ => vec![],
     }
 }
@@ -106,6 +130,7 @@ fn parse_assistant(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let content_blocks = match v.pointer("/message/content") {
         Some(Value::Array(arr)) => arr,
@@ -119,13 +144,16 @@ fn parse_assistant(
             "text" => {
                 let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 if !text.is_empty() {
-                    entries.push(LogEntry::new(
-                        timestamp,
-                        agent_name,
-                        agent_color,
-                        EntryType::Assistant,
-                        text.to_string(),
-                    ));
+                    entries.push(
+                        LogEntry::new(
+                            timestamp,
+                            agent_name,
+                            agent_color,
+                            EntryType::Assistant,
+                            text.to_string(),
+                        )
+                        .with_sidechain(is_sidechain),
+                    );
                 }
             }
             "tool_use" => {
@@ -142,29 +170,36 @@ fn parse_assistant(
                         EntryType::ToolUse,
                         content,
                     )
-                    .with_tool(name),
+                    .with_tool(name)
+                    .with_sidechain(is_sidechain),
                 );
             }
             "thinking" => {
                 let thinking = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
                 if !thinking.is_empty() {
-                    entries.push(LogEntry::new(
+                    entries.push(
+                        LogEntry::new(
+                            timestamp,
+                            agent_name,
+                            agent_color,
+                            EntryType::Thinking,
+                            thinking.to_string(),
+                        )
+                        .with_sidechain(is_sidechain),
+                    );
+                }
+            }
+            "redacted_thinking" => {
+                entries.push(
+                    LogEntry::new(
                         timestamp,
                         agent_name,
                         agent_color,
                         EntryType::Thinking,
-                        thinking.to_string(),
-                    ));
-                }
-            }
-            "redacted_thinking" => {
-                entries.push(LogEntry::new(
-                    timestamp,
-                    agent_name,
-                    agent_color,
-                    EntryType::Thinking,
-                    "[redacted thinking]".to_string(),
-                ));
+                        "[redacted thinking]".to_string(),
+                    )
+                    .with_sidechain(is_sidechain),
+                );
             }
             _ => {}
         }
@@ -321,6 +356,7 @@ fn parse_user(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let content = match v.pointer("/message/content") {
         Some(c) => c,
@@ -332,13 +368,16 @@ fn parse_user(
             if s.is_empty() {
                 return vec![];
             }
-            vec![LogEntry::new(
-                timestamp,
-                agent_name,
-                agent_color,
-                EntryType::User,
-                s.clone(),
-            )]
+            vec![
+                LogEntry::new(
+                    timestamp,
+                    agent_name,
+                    agent_color,
+                    EntryType::User,
+                    s.clone(),
+                )
+                .with_sidechain(is_sidechain),
+            ]
         }
         Value::Array(arr) => {
             let mut entries = Vec::new();
@@ -358,18 +397,22 @@ fn parse_user(
                             EntryType::ToolResult,
                             result_content,
                         )
-                        .with_error(is_error),
+                        .with_error(is_error)
+                        .with_sidechain(is_sidechain),
                     );
                 } else if block_type == "text" {
                     let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                     if !text.is_empty() {
-                        entries.push(LogEntry::new(
-                            timestamp,
-                            agent_name,
-                            agent_color,
-                            EntryType::User,
-                            text.to_string(),
-                        ));
+                        entries.push(
+                            LogEntry::new(
+                                timestamp,
+                                agent_name,
+                                agent_color,
+                                EntryType::User,
+                                text.to_string(),
+                            )
+                            .with_sidechain(is_sidechain),
+                        );
                     }
                 }
             }
@@ -384,6 +427,7 @@ fn parse_system(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
     let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
@@ -398,13 +442,16 @@ fn parse_system(
         format!("[system:{subtype}]")
     };
 
-    vec![LogEntry::new(
-        timestamp,
-        agent_name,
-        agent_color,
-        EntryType::System,
-        display,
-    )]
+    vec![
+        LogEntry::new(
+            timestamp,
+            agent_name,
+            agent_color,
+            EntryType::System,
+            display,
+        )
+        .with_sidechain(is_sidechain),
+    ]
 }
 
 fn parse_summary(
@@ -412,18 +459,22 @@ fn parse_summary(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
     if summary.is_empty() {
         return vec![];
     }
-    vec![LogEntry::new(
-        timestamp,
-        agent_name,
-        agent_color,
-        EntryType::Summary,
-        summary.to_string(),
-    )]
+    vec![
+        LogEntry::new(
+            timestamp,
+            agent_name,
+            agent_color,
+            EntryType::Summary,
+            summary.to_string(),
+        )
+        .with_sidechain(is_sidechain),
+    ]
 }
 
 fn parse_result(
@@ -431,6 +482,7 @@ fn parse_result(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
     let num_turns = v.get("num_turns").and_then(|n| n.as_u64());
@@ -469,7 +521,8 @@ fn parse_result(
             EntryType::Result,
             content,
         )
-        .with_error(is_error),
+        .with_error(is_error)
+        .with_sidechain(is_sidechain),
     ]
 }
 
@@ -478,6 +531,7 @@ fn parse_snapshot(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
+    is_sidechain: bool,
 ) -> Vec<LogEntry> {
     let is_update = v
         .get("isSnapshotUpdate")
@@ -488,13 +542,16 @@ fn parse_snapshot(
     } else {
         "[git snapshot]".to_string()
     };
-    vec![LogEntry::new(
-        timestamp,
-        agent_name,
-        agent_color,
-        EntryType::Snapshot,
-        content,
-    )]
+    vec![
+        LogEntry::new(
+            timestamp,
+            agent_name,
+            agent_color,
+            EntryType::Snapshot,
+            content,
+        )
+        .with_sidechain(is_sidechain),
+    ]
 }
 
 fn extract_tool_result_content(block: &Value) -> String {
@@ -715,5 +772,40 @@ mod tests {
         let entries = parse_line(line, "a", None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "→ team-lead: task done");
+    }
+
+    #[test]
+    fn parse_line_extracts_is_sidechain_true() {
+        let line = r#"{"type":"user","isSidechain":true,"timestamp":"T","message":{"role":"user","content":"hello from subagent"}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_sidechain);
+    }
+
+    #[test]
+    fn parse_line_defaults_is_sidechain_false() {
+        let line = r#"{"type":"user","timestamp":"T","message":{"role":"user","content":"hello"}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(!entries[0].is_sidechain);
+    }
+
+    #[test]
+    fn is_sidechain_propagates_to_all_blocks() {
+        let line = r#"{"type":"assistant","isSidechain":true,"timestamp":"T","message":{"role":"assistant","content":[{"type":"text","text":"working"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 2);
+        assert!(entries[0].is_sidechain);
+        assert!(entries[1].is_sidechain);
+        assert_eq!(entries[0].message_type, EntryType::Assistant);
+        assert_eq!(entries[1].message_type, EntryType::ToolUse);
+    }
+
+    #[test]
+    fn is_sidechain_serialized_in_json() {
+        let line = r#"{"type":"user","isSidechain":true,"timestamp":"T","message":{"role":"user","content":"x"}}"#;
+        let entries = parse_line(line, "a", None);
+        let json = serde_json::to_string(&entries[0]).unwrap();
+        assert!(json.contains("\"is_sidechain\":true"));
     }
 }

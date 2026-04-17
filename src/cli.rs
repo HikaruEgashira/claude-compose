@@ -64,6 +64,10 @@ pub struct LogsOpts {
     #[arg(long)]
     pub show_thinking: bool,
 
+    /// Hide sidechain (subagent/Task-tool) entries — shown by default
+    #[arg(long)]
+    pub hide_sidechain: bool,
+
     /// Filter by agent names
     pub agents: Vec<String>,
 }

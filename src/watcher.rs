@@ -99,6 +99,9 @@ fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Resul
         if should_skip_thinking(&entry.message_type, opts) {
             continue;
         }
+        if should_skip_sidechain(entry, opts) {
+            continue;
+        }
         print_entry(entry, opts, max_name_width);
     }
 
@@ -211,6 +214,9 @@ async fn follow_events(
                     continue;
                 }
                 if should_skip_thinking(&entry.message_type, opts) {
+                    continue;
+                }
+                if should_skip_sidechain(&entry, opts) {
                     continue;
                 }
                 print_entry(&entry, opts, max_name_width);
@@ -732,6 +738,13 @@ fn should_skip_thinking(entry_type: &EntryType, opts: &LogsOpts) -> bool {
     true
 }
 
+/// Decide whether to skip a sidechain (subagent/Task-tool) entry.
+/// Sidechain entries are shown by default; they are only suppressed when
+/// the user explicitly passed `--hide-sidechain`.
+fn should_skip_sidechain(entry: &LogEntry, opts: &LogsOpts) -> bool {
+    opts.hide_sidechain && entry.is_sidechain
+}
+
 fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
     if opts.json {
         println!("{}", format_entry_json(entry, opts.verbose));
@@ -818,6 +831,7 @@ mod tests {
             team: None,
             verbose: false,
             show_thinking: false,
+            hide_sidechain: false,
             agents: vec![],
         }
     }
@@ -873,6 +887,36 @@ mod tests {
         let mut opts = make_logs_opts();
         opts.type_filter = Some(MessageType::Thinking);
         assert!(!should_skip_thinking(&EntryType::Thinking, &opts));
+    }
+
+    fn make_sidechain_entry(is_sidechain: bool) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "agent".to_string(),
+            agent_color: None,
+            message_type: EntryType::Assistant,
+            content: "hi".to_string(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain,
+        }
+    }
+
+    #[test]
+    fn sidechain_shown_by_default() {
+        let opts = make_logs_opts();
+        let entry = make_sidechain_entry(true);
+        assert!(!should_skip_sidechain(&entry, &opts));
+    }
+
+    #[test]
+    fn sidechain_hidden_with_hide_sidechain_flag() {
+        let mut opts = make_logs_opts();
+        opts.hide_sidechain = true;
+        let sidechain = make_sidechain_entry(true);
+        let regular = make_sidechain_entry(false);
+        assert!(should_skip_sidechain(&sidechain, &opts));
+        assert!(!should_skip_sidechain(&regular, &opts));
     }
 
     #[test]
