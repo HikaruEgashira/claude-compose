@@ -68,6 +68,10 @@ pub struct LogsOpts {
     #[arg(long)]
     pub hide_sidechain: bool,
 
+    /// Append per-record metadata (model, usage tokens) to each non-JSON line
+    #[arg(long)]
+    pub show_metadata: bool,
+
     /// Filter by agent names
     pub agents: Vec<String>,
 }

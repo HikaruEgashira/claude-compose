@@ -2,14 +2,19 @@ use std::io::IsTerminal;
 
 use crossterm::style::{Color, Stylize};
 
-use crate::parser::{EntryType, LogEntry, format_timestamp};
+use crate::parser::{EntryType, LogEntry, Usage, format_timestamp};
 
 /// Format a LogEntry for terminal output.
+///
+/// When `show_metadata` (or `verbose`) is true, a dim-styled metadata suffix
+/// (model + token usage) is appended for entries that carry a `model` or
+/// `usage` value.
 pub fn format_entry(
     entry: &LogEntry,
     verbose: bool,
     no_color: bool,
     max_name_width: usize,
+    show_metadata: bool,
 ) -> String {
     let no_color =
         no_color || !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
@@ -28,8 +33,14 @@ pub fn format_entry(
         ("│", "|")
     };
 
+    let metadata_suffix = if verbose || show_metadata {
+        build_metadata_suffix(entry, no_color)
+    } else {
+        String::new()
+    };
+
     if no_color {
-        return format!("{timestamp} {name}{sep_no_color} {content}");
+        return format!("{timestamp} {name}{sep_no_color} {content}{metadata_suffix}");
     }
 
     let color = resolve_color(entry.agent_color.as_deref());
@@ -41,7 +52,47 @@ pub fn format_entry(
         render_inline_bold(&content)
     };
 
-    format!("{timestamp} {styled_name}{sep_color} {styled_content}")
+    format!("{timestamp} {styled_name}{sep_color} {styled_content}{metadata_suffix}")
+}
+
+/// Push usage tokens onto the metadata-suffix fragment list. Only fields that
+/// carry a `Some(_)` value are emitted, so the tail stays compact for smaller
+/// messages.
+fn append_usage_parts(usage: &Usage, parts: &mut Vec<String>) {
+    if let Some(n) = usage.input_tokens {
+        parts.push(format!("in={n}"));
+    }
+    if let Some(n) = usage.output_tokens {
+        parts.push(format!("out={n}"));
+    }
+    if let Some(n) = usage.cache_creation_input_tokens {
+        parts.push(format!("cache_w={n}"));
+    }
+    if let Some(n) = usage.cache_read_input_tokens {
+        parts.push(format!("cache_r={n}"));
+    }
+}
+
+/// Build a leading-space, dim-styled metadata tail summarising model and token
+/// usage for entries that have any such values. Returns an empty string when
+/// there is nothing to show.
+fn build_metadata_suffix(entry: &LogEntry, no_color: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = entry.model.as_deref() {
+        parts.push(format!("model={model}"));
+    }
+    if let Some(usage) = entry.usage.as_ref() {
+        append_usage_parts(usage, &mut parts);
+    }
+    if parts.is_empty() {
+        return String::new();
+    }
+    let body = format!(" · {}", parts.join(" · "));
+    if no_color {
+        body
+    } else {
+        body.as_str().dim().to_string()
+    }
 }
 
 fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
@@ -243,13 +294,18 @@ mod tests {
             tool_name: None,
             is_error: false,
             is_sidechain: false,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
         }
     }
 
     #[test]
     fn test_format_entry_basic() {
         let entry = make_entry(EntryType::Assistant, "UX要件を整理中...");
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("advocate"));
         assert!(output.contains("UX要件を整理中..."));
         assert!(output.contains("[12:57:14]"));
@@ -259,7 +315,7 @@ mod tests {
     fn test_format_tool_use() {
         let mut entry = make_entry(EntryType::ToolUse, "\"claude code log viewer github\"");
         entry.tool_name = Some("WebSearch".to_string());
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[web] WebSearch:"));
     }
 
@@ -267,7 +323,7 @@ mod tests {
     fn test_format_tool_use_unknown_uses_generic_icon() {
         let mut entry = make_entry(EntryType::ToolUse, "something");
         entry.tool_name = Some("SomeUnknownTool".to_string());
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[tool] SomeUnknownTool:"));
     }
 
@@ -275,7 +331,7 @@ mod tests {
     fn test_format_tool_use_mcp() {
         let mut entry = make_entry(EntryType::ToolUse, "[github] get_me: {}");
         entry.tool_name = Some("mcp__github__get_me".to_string());
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[mcp]"));
     }
 
@@ -283,7 +339,7 @@ mod tests {
     fn test_format_send_message() {
         let mut entry = make_entry(EntryType::ToolUse, "-> team-lead: done");
         entry.tool_name = Some("SendMessage".to_string());
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[msg]"));
     }
 
@@ -291,7 +347,7 @@ mod tests {
     fn test_format_task_completed() {
         let mut entry = make_entry(EntryType::ToolUse, "Task #1 completed");
         entry.tool_name = Some("TaskUpdate".to_string());
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[ok]"));
     }
 
@@ -299,7 +355,7 @@ mod tests {
     fn test_format_error() {
         let mut entry = make_entry(EntryType::System, "API rate limit exceeded");
         entry.is_error = true;
-        let output = format_entry(&entry, false, true, 20);
+        let output = format_entry(&entry, false, true, 20, false);
         assert!(output.contains("[err]"));
     }
 
@@ -390,7 +446,7 @@ mod tests {
     #[test]
     fn test_timestamp_shortened() {
         let entry = make_entry(EntryType::Assistant, "test");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         // Should show HH:MM:SS not full ISO 8601
         assert!(output.contains("[12:57:14]"));
         assert!(!output.contains("2026-04-12"));
@@ -419,7 +475,7 @@ mod tests {
     #[test]
     fn test_format_thinking_entry_no_color() {
         let entry = make_entry(EntryType::Thinking, "pondering a tricky bug");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(output.contains("[thinking]"));
         assert!(output.contains("pondering a tricky bug"));
     }
@@ -427,7 +483,7 @@ mod tests {
     #[test]
     fn test_format_summary_entry_no_color() {
         let entry = make_entry(EntryType::Summary, "compacted history");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(output.contains("[summary]"));
         assert!(output.contains("compacted history"));
     }
@@ -435,7 +491,7 @@ mod tests {
     #[test]
     fn test_format_result_entry_no_color() {
         let entry = make_entry(EntryType::Result, "session result: success (turns=3)");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(output.contains("[result]"));
         assert!(output.contains("turns=3"));
     }
@@ -443,7 +499,7 @@ mod tests {
     #[test]
     fn test_format_snapshot_entry_no_color() {
         let entry = make_entry(EntryType::Snapshot, "[git snapshot]");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(output.contains("[snapshot]"));
     }
 
@@ -451,7 +507,7 @@ mod tests {
     fn test_format_entry_sidechain_separator() {
         let mut entry = make_entry(EntryType::Assistant, "subagent text");
         entry.is_sidechain = true;
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(
             output.contains(">-"),
             "expected sidechain ASCII separator '>-' in {output:?}"
@@ -466,7 +522,7 @@ mod tests {
     #[test]
     fn test_format_entry_regular_separator() {
         let entry = make_entry(EntryType::Assistant, "main text");
-        let output = format_entry(&entry, false, true, 10);
+        let output = format_entry(&entry, false, true, 10, false);
         assert!(
             output.contains('|'),
             "regular entry should use '|' separator: {output:?}"
@@ -474,6 +530,86 @@ mod tests {
         assert!(
             !output.contains(">-"),
             "regular entry must not use sidechain separator: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_entry_metadata_suffix_shown_with_flag() {
+        use crate::parser::Usage;
+        let mut entry = make_entry(EntryType::Assistant, "response");
+        entry.model = Some("claude-sonnet-4-6".to_string());
+        entry.usage = Some(Usage {
+            input_tokens: Some(123),
+            output_tokens: Some(456),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: Some(1500),
+        });
+        let output = format_entry(&entry, false, true, 10, true);
+        assert!(
+            output.contains("model=claude-sonnet-4-6"),
+            "expected model in suffix: {output:?}"
+        );
+        assert!(output.contains("in=123"), "expected in=123 in {output:?}");
+        assert!(output.contains("out=456"), "expected out=456 in {output:?}");
+        assert!(
+            output.contains("cache_r=1500"),
+            "expected cache_r=1500 in {output:?}"
+        );
+        assert!(
+            !output.contains("cache_w="),
+            "cache_w should be absent when None: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_entry_metadata_hidden_by_default() {
+        use crate::parser::Usage;
+        let mut entry = make_entry(EntryType::Assistant, "response");
+        entry.model = Some("claude-sonnet-4-6".to_string());
+        entry.usage = Some(Usage {
+            input_tokens: Some(7),
+            output_tokens: Some(8),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+        let output = format_entry(&entry, false, true, 10, false);
+        assert!(
+            !output.contains("model="),
+            "metadata suffix should be hidden without flag: {output:?}"
+        );
+        assert!(
+            !output.contains("in="),
+            "usage tokens should be hidden without flag: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_entry_metadata_shown_with_verbose() {
+        use crate::parser::Usage;
+        let mut entry = make_entry(EntryType::Assistant, "response");
+        entry.model = Some("claude-haiku".to_string());
+        entry.usage = Some(Usage {
+            input_tokens: Some(1),
+            output_tokens: Some(2),
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+        // verbose=true, show_metadata=false — metadata suffix should still
+        // appear because verbose implies full detail.
+        let output = format_entry(&entry, true, true, 10, false);
+        assert!(output.contains("model=claude-haiku"));
+        assert!(output.contains("in=1"));
+    }
+
+    #[test]
+    fn test_format_entry_metadata_empty_for_non_assistant() {
+        // An entry with no model/usage should not produce any suffix even
+        // when the flag is on.
+        let entry = make_entry(EntryType::User, "hi");
+        let output = format_entry(&entry, false, true, 10, true);
+        assert!(
+            !output.contains(" · "),
+            "no metadata suffix expected when fields are None: {output:?}"
         );
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -26,13 +26,29 @@ pub struct AgentFile {
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     let mut agent_files = discover_files(&opts)?;
-    let max_name_width = tail_entries(&mut agent_files, &opts)?;
+    // Deduplication set shared across tail + follow. Claude Code's
+    // stream-json input is known to emit duplicate JSONL lines
+    // (anthropics/claude-code#5034); we skip any entry whose uuid has
+    // already been printed.
+    let mut seen_uuids: HashSet<String> = HashSet::new();
+    let max_name_width = tail_entries(&mut agent_files, &opts, &mut seen_uuids)?;
 
     if opts.follow {
-        follow_events(&mut agent_files, &opts, max_name_width).await?;
+        follow_events(&mut agent_files, &opts, max_name_width, &mut seen_uuids).await?;
     }
 
     Ok(())
+}
+
+/// Returns true when the entry should be skipped as a duplicate.
+/// Entries with `None` uuid pass through unchanged (no fingerprint to
+/// deduplicate on). First-seen uuids are inserted and allowed through.
+fn is_duplicate_uuid(entry: &LogEntry, seen: &mut HashSet<String>) -> bool {
+    if let Some(uuid) = entry.uuid.as_deref() {
+        !seen.insert(uuid.to_string())
+    } else {
+        false
+    }
 }
 
 /// Discover agent log files based on --team flag or auto-detection.
@@ -76,7 +92,11 @@ fn discover_files(opts: &LogsOpts) -> anyhow::Result<Vec<AgentFile>> {
 
 /// Read existing log entries from all agent files, apply tail limit, and print.
 /// Returns the computed max_name_width for consistent formatting in follow mode.
-fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Result<usize> {
+fn tail_entries(
+    agent_files: &mut [AgentFile],
+    opts: &LogsOpts,
+    seen_uuids: &mut HashSet<String>,
+) -> anyhow::Result<usize> {
     let max_name_width = agent_files
         .iter()
         .map(|af| af.agent_name.len())
@@ -102,6 +122,9 @@ fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Resul
         if should_skip_sidechain(entry, opts) {
             continue;
         }
+        if is_duplicate_uuid(entry, seen_uuids) {
+            continue;
+        }
         print_entry(entry, opts, max_name_width);
     }
 
@@ -113,6 +136,7 @@ async fn follow_events(
     agent_files: &mut Vec<AgentFile>,
     opts: &LogsOpts,
     max_name_width: usize,
+    seen_uuids: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
@@ -217,6 +241,9 @@ async fn follow_events(
                     continue;
                 }
                 if should_skip_sidechain(&entry, opts) {
+                    continue;
+                }
+                if is_duplicate_uuid(&entry, seen_uuids) {
                     continue;
                 }
                 print_entry(&entry, opts, max_name_width);
@@ -751,7 +778,13 @@ fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
     } else {
         println!(
             "{}",
-            format_entry(entry, opts.verbose, opts.no_color, max_name_width)
+            format_entry(
+                entry,
+                opts.verbose,
+                opts.no_color,
+                max_name_width,
+                opts.show_metadata
+            )
         );
     }
 }
@@ -832,6 +865,7 @@ mod tests {
             verbose: false,
             show_thinking: false,
             hide_sidechain: false,
+            show_metadata: false,
             agents: vec![],
         }
     }
@@ -899,6 +933,11 @@ mod tests {
             tool_name: None,
             is_error: false,
             is_sidechain,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
         }
     }
 
@@ -1133,5 +1172,47 @@ mod tests {
     fn unique_name_with_collision() {
         let existing = vec![make_agent_file("proj"), make_agent_file("proj-2")];
         assert_eq!(unique_name("proj", &existing), "proj-3");
+    }
+
+    fn entry_with_uuid(uuid: Option<&str>) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "agent".to_string(),
+            agent_color: None,
+            message_type: EntryType::Assistant,
+            content: "hi".to_string(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain: false,
+            uuid: uuid.map(String::from),
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_by_uuid_skips_second_occurrence() {
+        let mut seen: HashSet<String> = HashSet::new();
+        let first = entry_with_uuid(Some("abc"));
+        let duplicate = entry_with_uuid(Some("abc"));
+        let novel = entry_with_uuid(Some("def"));
+
+        assert!(!is_duplicate_uuid(&first, &mut seen));
+        assert!(is_duplicate_uuid(&duplicate, &mut seen));
+        assert!(!is_duplicate_uuid(&novel, &mut seen));
+    }
+
+    #[test]
+    fn dedupe_by_uuid_passes_through_none_uuids() {
+        let mut seen: HashSet<String> = HashSet::new();
+        // Entries with no uuid always pass through — we have nothing to
+        // fingerprint them by, so they're considered unique.
+        let a = entry_with_uuid(None);
+        let b = entry_with_uuid(None);
+        assert!(!is_duplicate_uuid(&a, &mut seen));
+        assert!(!is_duplicate_uuid(&b, &mut seen));
+        assert!(seen.is_empty());
     }
 }

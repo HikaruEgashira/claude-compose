@@ -15,6 +15,59 @@ pub struct LogEntry {
     /// Defaults to false for regular conversation entries.
     #[serde(default)]
     pub is_sidechain: bool,
+    /// Per-record unique identifier from Claude Code JSONL. Used for
+    /// deduplication when stream-json input duplicates entries.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub uuid: Option<String>,
+    /// Parent UUID for threading across records.
+    #[serde(
+        rename = "parentUuid",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub parent_uuid: Option<String>,
+    /// Model that produced the assistant response (only populated for
+    /// assistant records).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub model: Option<String>,
+    /// Stop reason emitted by the model (`end_turn`, `tool_use`, etc.).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub stop_reason: Option<String>,
+    /// Usage statistics (input/output/cache tokens) for assistant messages.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub usage: Option<Usage>,
+}
+
+/// Token-usage metadata carried on assistant records.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct Usage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+    #[serde(
+        rename = "cache_creation_input_tokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_creation_input_tokens: Option<u64>,
+    #[serde(
+        rename = "cache_read_input_tokens",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_read_input_tokens: Option<u64>,
+}
+
+/// Metadata shared by every LogEntry emitted from a single JSONL record.
+#[derive(Debug, Clone, Default)]
+struct RecordMeta {
+    is_sidechain: bool,
+    uuid: Option<String>,
+    parent_uuid: Option<String>,
+    model: Option<String>,
+    stop_reason: Option<String>,
+    usage: Option<Usage>,
 }
 
 impl LogEntry {
@@ -36,6 +89,11 @@ impl LogEntry {
             tool_name: None,
             is_error: false,
             is_sidechain: false,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
         }
     }
 
@@ -49,8 +107,13 @@ impl LogEntry {
         self
     }
 
-    fn with_sidechain(mut self, is_sidechain: bool) -> Self {
-        self.is_sidechain = is_sidechain;
+    fn with_meta(mut self, meta: &RecordMeta) -> Self {
+        self.is_sidechain = meta.is_sidechain;
+        self.uuid = meta.uuid.clone();
+        self.parent_uuid = meta.parent_uuid.clone();
+        self.model = meta.model.clone();
+        self.stop_reason = meta.stop_reason.clone();
+        self.usage = meta.usage.clone();
         self
     }
 }
@@ -83,6 +146,23 @@ pub fn parse_line(line: &str, agent_name: &str, agent_color: Option<&str>) -> Ve
 
     let top_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+    let meta = extract_record_meta(&v);
+
+    match top_type {
+        "assistant" => parse_assistant(&v, &timestamp, agent_name, agent_color, &meta),
+        "user" => parse_user(&v, &timestamp, agent_name, agent_color, &meta),
+        "system" => parse_system(&v, &timestamp, agent_name, agent_color, &meta),
+        "summary" => parse_summary(&v, &timestamp, agent_name, agent_color, &meta),
+        "result" => parse_result(&v, &timestamp, agent_name, agent_color, &meta),
+        "file-history-snapshot" => parse_snapshot(&v, &timestamp, agent_name, agent_color, &meta),
+        _ => vec![],
+    }
+}
+
+/// Extract the per-record metadata (uuid, parent, model, stop_reason, usage,
+/// is_sidechain) once up front so every LogEntry emitted from this line can
+/// share the same metadata values.
+fn extract_record_meta(v: &Value) -> RecordMeta {
     // Claude Code marks subagent (Task-tool) entries inline in the parent
     // JSONL with a top-level `isSidechain: true` flag. We propagate this to
     // every LogEntry produced so downstream filters / renderers can treat
@@ -92,17 +172,54 @@ pub fn parse_line(line: &str, agent_name: &str, agent_color: Option<&str>) -> Ve
         .and_then(|b| b.as_bool())
         .unwrap_or(false);
 
-    match top_type {
-        "assistant" => parse_assistant(&v, &timestamp, agent_name, agent_color, is_sidechain),
-        "user" => parse_user(&v, &timestamp, agent_name, agent_color, is_sidechain),
-        "system" => parse_system(&v, &timestamp, agent_name, agent_color, is_sidechain),
-        "summary" => parse_summary(&v, &timestamp, agent_name, agent_color, is_sidechain),
-        "result" => parse_result(&v, &timestamp, agent_name, agent_color, is_sidechain),
-        "file-history-snapshot" => {
-            parse_snapshot(&v, &timestamp, agent_name, agent_color, is_sidechain)
-        }
-        _ => vec![],
+    let uuid = v.get("uuid").and_then(|s| s.as_str()).map(String::from);
+    let parent_uuid = v
+        .get("parentUuid")
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let model = v
+        .pointer("/message/model")
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let stop_reason = v
+        .pointer("/message/stop_reason")
+        .and_then(|s| s.as_str())
+        .map(String::from);
+    let usage = v.pointer("/message/usage").and_then(extract_usage);
+
+    RecordMeta {
+        is_sidechain,
+        uuid,
+        parent_uuid,
+        model,
+        stop_reason,
+        usage,
     }
+}
+
+/// Parse a `/message/usage` object into a `Usage` struct. Returns None if
+/// every field is missing so we don't emit an empty usage blob.
+fn extract_usage(v: &Value) -> Option<Usage> {
+    let obj = v.as_object()?;
+    let input_tokens = obj.get("input_tokens").and_then(|n| n.as_u64());
+    let output_tokens = obj.get("output_tokens").and_then(|n| n.as_u64());
+    let cache_creation_input_tokens = obj
+        .get("cache_creation_input_tokens")
+        .and_then(|n| n.as_u64());
+    let cache_read_input_tokens = obj.get("cache_read_input_tokens").and_then(|n| n.as_u64());
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && cache_creation_input_tokens.is_none()
+        && cache_read_input_tokens.is_none()
+    {
+        return None;
+    }
+    Some(Usage {
+        input_tokens,
+        output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
+    })
 }
 
 /// Truncate a string to at most `max` characters (not bytes).
@@ -130,7 +247,7 @@ fn parse_assistant(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let content_blocks = match v.pointer("/message/content") {
         Some(Value::Array(arr)) => arr,
@@ -152,7 +269,7 @@ fn parse_assistant(
                             EntryType::Assistant,
                             text.to_string(),
                         )
-                        .with_sidechain(is_sidechain),
+                        .with_meta(meta),
                     );
                 }
             }
@@ -171,7 +288,7 @@ fn parse_assistant(
                         content,
                     )
                     .with_tool(name)
-                    .with_sidechain(is_sidechain),
+                    .with_meta(meta),
                 );
             }
             "thinking" => {
@@ -185,7 +302,7 @@ fn parse_assistant(
                             EntryType::Thinking,
                             thinking.to_string(),
                         )
-                        .with_sidechain(is_sidechain),
+                        .with_meta(meta),
                     );
                 }
             }
@@ -198,7 +315,7 @@ fn parse_assistant(
                         EntryType::Thinking,
                         "[redacted thinking]".to_string(),
                     )
-                    .with_sidechain(is_sidechain),
+                    .with_meta(meta),
                 );
             }
             _ => {}
@@ -356,7 +473,7 @@ fn parse_user(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let content = match v.pointer("/message/content") {
         Some(c) => c,
@@ -376,7 +493,7 @@ fn parse_user(
                     EntryType::User,
                     s.clone(),
                 )
-                .with_sidechain(is_sidechain),
+                .with_meta(meta),
             ]
         }
         Value::Array(arr) => {
@@ -398,7 +515,7 @@ fn parse_user(
                             result_content,
                         )
                         .with_error(is_error)
-                        .with_sidechain(is_sidechain),
+                        .with_meta(meta),
                     );
                 } else if block_type == "text" {
                     let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
@@ -411,7 +528,7 @@ fn parse_user(
                                 EntryType::User,
                                 text.to_string(),
                             )
-                            .with_sidechain(is_sidechain),
+                            .with_meta(meta),
                         );
                     }
                 }
@@ -427,7 +544,7 @@ fn parse_system(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let content = v.get("content").and_then(|c| c.as_str()).unwrap_or("");
     let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
@@ -450,7 +567,7 @@ fn parse_system(
             EntryType::System,
             display,
         )
-        .with_sidechain(is_sidechain),
+        .with_meta(meta),
     ]
 }
 
@@ -459,7 +576,7 @@ fn parse_summary(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
     if summary.is_empty() {
@@ -473,7 +590,7 @@ fn parse_summary(
             EntryType::Summary,
             summary.to_string(),
         )
-        .with_sidechain(is_sidechain),
+        .with_meta(meta),
     ]
 }
 
@@ -482,7 +599,7 @@ fn parse_result(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
     let num_turns = v.get("num_turns").and_then(|n| n.as_u64());
@@ -522,7 +639,7 @@ fn parse_result(
             content,
         )
         .with_error(is_error)
-        .with_sidechain(is_sidechain),
+        .with_meta(meta),
     ]
 }
 
@@ -531,7 +648,7 @@ fn parse_snapshot(
     timestamp: &str,
     agent_name: &str,
     agent_color: Option<&str>,
-    is_sidechain: bool,
+    meta: &RecordMeta,
 ) -> Vec<LogEntry> {
     let is_update = v
         .get("isSnapshotUpdate")
@@ -550,7 +667,7 @@ fn parse_snapshot(
             EntryType::Snapshot,
             content,
         )
-        .with_sidechain(is_sidechain),
+        .with_meta(meta),
     ]
 }
 
@@ -807,5 +924,87 @@ mod tests {
         let entries = parse_line(line, "a", None);
         let json = serde_json::to_string(&entries[0]).unwrap();
         assert!(json.contains("\"is_sidechain\":true"));
+    }
+
+    #[test]
+    fn parse_line_extracts_uuid_and_parent() {
+        let line = r#"{"type":"user","uuid":"child-1","parentUuid":"parent-0","timestamp":"T","message":{"role":"user","content":"hi"}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].uuid.as_deref(), Some("child-1"));
+        assert_eq!(entries[0].parent_uuid.as_deref(), Some("parent-0"));
+    }
+
+    #[test]
+    fn parse_line_extracts_model_and_stop_reason() {
+        let line = r#"{"type":"assistant","uuid":"a1","timestamp":"T","message":{"role":"assistant","model":"claude-sonnet-4-6","stop_reason":"end_turn","content":[{"type":"text","text":"done"}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(entries[0].stop_reason.as_deref(), Some("end_turn"));
+    }
+
+    #[test]
+    fn parse_line_extracts_usage_with_cache_tokens() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","model":"claude","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":11,"output_tokens":22,"cache_creation_input_tokens":33,"cache_read_input_tokens":44}}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        let usage = entries[0].usage.as_ref().expect("usage expected");
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(22));
+        assert_eq!(usage.cache_creation_input_tokens, Some(33));
+        assert_eq!(usage.cache_read_input_tokens, Some(44));
+    }
+
+    #[test]
+    fn parse_line_uuid_absent_is_none() {
+        let line = r#"{"type":"user","timestamp":"T","message":{"role":"user","content":"hi"}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].uuid.is_none());
+        assert!(entries[0].parent_uuid.is_none());
+        assert!(entries[0].model.is_none());
+        assert!(entries[0].stop_reason.is_none());
+        assert!(entries[0].usage.is_none());
+    }
+
+    #[test]
+    fn metadata_shared_across_all_blocks_from_same_line() {
+        let line = r#"{"type":"assistant","uuid":"same-uuid","parentUuid":"parent","timestamp":"T","message":{"role":"assistant","model":"claude-sonnet-4-6","stop_reason":"tool_use","content":[{"type":"text","text":"thinking out loud"},{"type":"tool_use","id":"t1","name":"Bash","input":{"command":"ls"}},{"type":"thinking","thinking":"hmm","signature":"s"}],"usage":{"input_tokens":1,"output_tokens":2}}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 3);
+        for entry in &entries {
+            assert_eq!(entry.uuid.as_deref(), Some("same-uuid"));
+            assert_eq!(entry.parent_uuid.as_deref(), Some("parent"));
+            assert_eq!(entry.model.as_deref(), Some("claude-sonnet-4-6"));
+            assert_eq!(entry.stop_reason.as_deref(), Some("tool_use"));
+            let usage = entry.usage.as_ref().expect("usage shared");
+            assert_eq!(usage.input_tokens, Some(1));
+            assert_eq!(usage.output_tokens, Some(2));
+        }
+    }
+
+    #[test]
+    fn parent_uuid_serialized_as_camel_case() {
+        let line = r#"{"type":"user","uuid":"u1","parentUuid":"p0","timestamp":"T","message":{"role":"user","content":"x"}}"#;
+        let entries = parse_line(line, "a", None);
+        let json = serde_json::to_string(&entries[0]).unwrap();
+        assert!(
+            json.contains("\"parentUuid\":\"p0\""),
+            "parentUuid should serialise in camelCase: {json}"
+        );
+    }
+
+    #[test]
+    fn usage_cache_tokens_serialize_with_original_names() {
+        let u = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(20),
+            cache_creation_input_tokens: Some(30),
+            cache_read_input_tokens: Some(40),
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("\"cache_creation_input_tokens\":30"));
+        assert!(json.contains("\"cache_read_input_tokens\":40"));
     }
 }
