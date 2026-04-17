@@ -93,9 +93,13 @@ fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Resul
 
     let start = all_entries.len().saturating_sub(opts.tail);
     for entry in &all_entries[start..] {
-        if matches_filter(&entry.message_type, &opts.type_filter) {
-            print_entry(entry, opts, max_name_width);
+        if !matches_filter(&entry.message_type, &opts.type_filter) {
+            continue;
         }
+        if should_skip_thinking(&entry.message_type, opts) {
+            continue;
+        }
+        print_entry(entry, opts, max_name_width);
     }
 
     Ok(max_name_width)
@@ -204,6 +208,9 @@ async fn follow_events(
             let new_entries = read_new_lines(af)?;
             for entry in new_entries {
                 if !matches_filter(&entry.message_type, &opts.type_filter) {
+                    continue;
+                }
+                if should_skip_thinking(&entry.message_type, opts) {
                     continue;
                 }
                 print_entry(&entry, opts, max_name_width);
@@ -701,7 +708,28 @@ fn matches_filter(entry_type: &EntryType, filter: &Option<MessageType>) -> bool 
             | (MessageType::System, EntryType::System)
             | (MessageType::ToolUse, EntryType::ToolUse)
             | (MessageType::ToolResult, EntryType::ToolResult)
+            | (MessageType::Thinking, EntryType::Thinking)
+            | (MessageType::Summary, EntryType::Summary)
+            | (MessageType::Result, EntryType::Result)
+            | (MessageType::Snapshot, EntryType::Snapshot)
     )
+}
+
+/// Decide whether to skip a Thinking entry based on `--show-thinking` and
+/// the active type filter. Thinking entries are hidden by default unless:
+///   - the user explicitly passed `--show-thinking`, OR
+///   - the user explicitly filtered to `--type thinking`.
+fn should_skip_thinking(entry_type: &EntryType, opts: &LogsOpts) -> bool {
+    if *entry_type != EntryType::Thinking {
+        return false;
+    }
+    if opts.show_thinking {
+        return false;
+    }
+    if matches!(opts.type_filter, Some(MessageType::Thinking)) {
+        return false;
+    }
+    true
 }
 
 fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
@@ -779,6 +807,73 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_logs_opts() -> LogsOpts {
+        LogsOpts {
+            follow: false,
+            tail: 50,
+            type_filter: None,
+            json: false,
+            no_color: true,
+            team: None,
+            verbose: false,
+            show_thinking: false,
+            agents: vec![],
+        }
+    }
+
+    #[test]
+    fn matches_filter_none_passes_all() {
+        assert!(matches_filter(&EntryType::Thinking, &None));
+        assert!(matches_filter(&EntryType::Summary, &None));
+        assert!(matches_filter(&EntryType::Result, &None));
+        assert!(matches_filter(&EntryType::Snapshot, &None));
+    }
+
+    #[test]
+    fn matches_filter_maps_new_variants() {
+        assert!(matches_filter(
+            &EntryType::Thinking,
+            &Some(MessageType::Thinking)
+        ));
+        assert!(matches_filter(
+            &EntryType::Summary,
+            &Some(MessageType::Summary)
+        ));
+        assert!(matches_filter(
+            &EntryType::Result,
+            &Some(MessageType::Result)
+        ));
+        assert!(matches_filter(
+            &EntryType::Snapshot,
+            &Some(MessageType::Snapshot)
+        ));
+        assert!(!matches_filter(
+            &EntryType::Assistant,
+            &Some(MessageType::Thinking)
+        ));
+    }
+
+    #[test]
+    fn thinking_hidden_by_default() {
+        let opts = make_logs_opts();
+        assert!(should_skip_thinking(&EntryType::Thinking, &opts));
+        assert!(!should_skip_thinking(&EntryType::Assistant, &opts));
+    }
+
+    #[test]
+    fn thinking_shown_with_show_thinking_flag() {
+        let mut opts = make_logs_opts();
+        opts.show_thinking = true;
+        assert!(!should_skip_thinking(&EntryType::Thinking, &opts));
+    }
+
+    #[test]
+    fn thinking_shown_with_explicit_type_filter() {
+        let mut opts = make_logs_opts();
+        opts.type_filter = Some(MessageType::Thinking);
+        assert!(!should_skip_thinking(&EntryType::Thinking, &opts));
+    }
 
     #[test]
     fn parent_pid_returns_valid_for_self() {

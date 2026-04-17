@@ -60,6 +60,10 @@ pub struct LogsOpts {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Show assistant thinking blocks (hidden by default)
+    #[arg(long)]
+    pub show_thinking: bool,
+
     /// Filter by agent names
     pub agents: Vec<String>,
 }
@@ -89,11 +93,15 @@ pub struct DownOpts {
     pub path: String,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, PartialEq)]
 pub enum MessageType {
     Assistant,
     User,
     System,
     ToolUse,
     ToolResult,
+    Thinking,
+    Summary,
+    Result,
+    Snapshot,
 }

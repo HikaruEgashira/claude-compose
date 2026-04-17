@@ -56,6 +56,36 @@ fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
                 truncate_lines(&entry.content, 3)
             }
         }
+        EntryType::Thinking => {
+            if no_color {
+                format!("[thinking] {}", entry.content)
+            } else {
+                // Dim styled thinking prefix with a thought-bubble emoji.
+                let body = format!("\u{1f4ad} {}", entry.content);
+                body.as_str().dim().to_string()
+            }
+        }
+        EntryType::Summary => {
+            let prefix = if no_color {
+                "[summary] "
+            } else {
+                "\u{2261} summary: "
+            };
+            format!("{prefix}{}", entry.content)
+        }
+        EntryType::Result => {
+            let prefix = if no_color { "[result] " } else { "\u{23f9} " };
+            if entry.is_error {
+                let icon = if no_color { "[err]" } else { "\u{f071}" };
+                format!("{prefix}{icon} {}", entry.content)
+            } else {
+                format!("{prefix}{}", entry.content)
+            }
+        }
+        EntryType::Snapshot => {
+            let prefix = if no_color { "[snapshot] " } else { "\u{25f7} " };
+            format!("{prefix}{}", entry.content)
+        }
         _ => {
             if entry.is_error {
                 let icon = if no_color { "[err]" } else { "\u{f071}" };
@@ -94,6 +124,12 @@ fn tool_icon(tool: &str, content: &str, no_color: bool) -> &'static str {
             "SendMessage" => "[msg]",
             "TaskUpdate" if content.contains("completed") => "[ok]",
             "TaskCreate" => "[new]",
+            "Task" => "[task]",
+            "TodoWrite" => "[todo]",
+            "WebSearch" | "WebFetch" => "[web]",
+            "ExitPlanMode" => "[plan]",
+            "Skill" => "[skill]",
+            t if t.starts_with("mcp__") => "[mcp]",
             _ => "[tool]",
         }
     } else {
@@ -101,6 +137,12 @@ fn tool_icon(tool: &str, content: &str, no_color: bool) -> &'static str {
             "SendMessage" => "\u{f1d8}", // paper-plane
             "TaskUpdate" if content.contains("completed") => "\u{f00c}", // check
             "TaskCreate" => "\u{f0ca}",  // list
+            "Task" => "\u{f03a}",        // list-alt
+            "TodoWrite" => "\u{f14a}",   // check-square
+            "WebSearch" | "WebFetch" => "\u{f0ac}", // globe
+            "ExitPlanMode" => "\u{f024}", // flag
+            "Skill" => "\u{f005}",       // star / sparkle
+            t if t.starts_with("mcp__") => "\u{f1e6}", // plug
             _ => "\u{f0ad}",             // wrench
         }
     }
@@ -132,7 +174,7 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
 fn compact_entry(entry: &LogEntry) -> LogEntry {
     let content = match entry.message_type {
         EntryType::ToolResult => truncate_lines(&entry.content, 3),
-        EntryType::Assistant => truncate_chars(&entry.content, 200),
+        EntryType::Assistant | EntryType::Thinking => truncate_chars(&entry.content, 200),
         _ => entry.content.clone(),
     };
     LogEntry {
@@ -209,7 +251,23 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "\"claude code log viewer github\"");
         entry.tool_name = Some("WebSearch".to_string());
         let output = format_entry(&entry, false, true, 20);
-        assert!(output.contains("[tool] WebSearch:"));
+        assert!(output.contains("[web] WebSearch:"));
+    }
+
+    #[test]
+    fn test_format_tool_use_unknown_uses_generic_icon() {
+        let mut entry = make_entry(EntryType::ToolUse, "something");
+        entry.tool_name = Some("SomeUnknownTool".to_string());
+        let output = format_entry(&entry, false, true, 20);
+        assert!(output.contains("[tool] SomeUnknownTool:"));
+    }
+
+    #[test]
+    fn test_format_tool_use_mcp() {
+        let mut entry = make_entry(EntryType::ToolUse, "[github] get_me: {}");
+        entry.tool_name = Some("mcp__github__get_me".to_string());
+        let output = format_entry(&entry, false, true, 20);
+        assert!(output.contains("[mcp]"));
     }
 
     #[test]
@@ -347,5 +405,36 @@ mod tests {
     fn test_render_inline_bold_unclosed() {
         let result = render_inline_bold("open **bold but no close");
         assert_eq!(result, "open **bold but no close");
+    }
+
+    #[test]
+    fn test_format_thinking_entry_no_color() {
+        let entry = make_entry(EntryType::Thinking, "pondering a tricky bug");
+        let output = format_entry(&entry, false, true, 10);
+        assert!(output.contains("[thinking]"));
+        assert!(output.contains("pondering a tricky bug"));
+    }
+
+    #[test]
+    fn test_format_summary_entry_no_color() {
+        let entry = make_entry(EntryType::Summary, "compacted history");
+        let output = format_entry(&entry, false, true, 10);
+        assert!(output.contains("[summary]"));
+        assert!(output.contains("compacted history"));
+    }
+
+    #[test]
+    fn test_format_result_entry_no_color() {
+        let entry = make_entry(EntryType::Result, "session result: success (turns=3)");
+        let output = format_entry(&entry, false, true, 10);
+        assert!(output.contains("[result]"));
+        assert!(output.contains("turns=3"));
+    }
+
+    #[test]
+    fn test_format_snapshot_entry_no_color() {
+        let entry = make_entry(EntryType::Snapshot, "[git snapshot]");
+        let output = format_entry(&entry, false, true, 10);
+        assert!(output.contains("[snapshot]"));
     }
 }

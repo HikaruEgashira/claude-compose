@@ -49,6 +49,10 @@ pub enum EntryType {
     System,
     ToolUse,
     ToolResult,
+    Thinking,
+    Summary,
+    Result,
+    Snapshot,
 }
 
 /// Parse a single JSONL line into zero or more LogEntry values.
@@ -70,6 +74,9 @@ pub fn parse_line(line: &str, agent_name: &str, agent_color: Option<&str>) -> Ve
         "assistant" => parse_assistant(&v, &timestamp, agent_name, agent_color),
         "user" => parse_user(&v, &timestamp, agent_name, agent_color),
         "system" => parse_system(&v, &timestamp, agent_name, agent_color),
+        "summary" => parse_summary(&v, &timestamp, agent_name, agent_color),
+        "result" => parse_result(&v, &timestamp, agent_name, agent_color),
+        "file-history-snapshot" => parse_snapshot(&v, &timestamp, agent_name, agent_color),
         _ => vec![],
     }
 }
@@ -138,7 +145,27 @@ fn parse_assistant(
                     .with_tool(name),
                 );
             }
-            "thinking" => {}
+            "thinking" => {
+                let thinking = block.get("thinking").and_then(|t| t.as_str()).unwrap_or("");
+                if !thinking.is_empty() {
+                    entries.push(LogEntry::new(
+                        timestamp,
+                        agent_name,
+                        agent_color,
+                        EntryType::Thinking,
+                        thinking.to_string(),
+                    ));
+                }
+            }
+            "redacted_thinking" => {
+                entries.push(LogEntry::new(
+                    timestamp,
+                    agent_name,
+                    agent_color,
+                    EntryType::Thinking,
+                    "[redacted thinking]".to_string(),
+                ));
+            }
             _ => {}
         }
     }
@@ -189,6 +216,101 @@ fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String {
         "Glob" => {
             let pattern = input.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
             pattern.to_string()
+        }
+        "Task" => {
+            let subagent_type = input
+                .get("subagent_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let description = input
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !subagent_type.is_empty() && !description.is_empty() {
+                format!("{subagent_type}: {description}")
+            } else if !subagent_type.is_empty() {
+                let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                format!("{subagent_type}: {}", truncate_chars(prompt, 60))
+            } else {
+                let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
+                truncate_chars(prompt, 60)
+            }
+        }
+        "TodoWrite" => {
+            let todos = input.get("todos").and_then(|v| v.as_array());
+            match todos {
+                Some(arr) if arr.is_empty() => "todos cleared".to_string(),
+                Some(arr) => {
+                    let n = arr.len();
+                    let in_progress = arr
+                        .iter()
+                        .filter(|t| t.get("status").and_then(|s| s.as_str()) == Some("in_progress"))
+                        .count();
+                    format!("{n} todos ({in_progress} in progress)")
+                }
+                None => "todos cleared".to_string(),
+            }
+        }
+        "WebSearch" => {
+            let query = input.get("query").and_then(|v| v.as_str()).unwrap_or("");
+            query.to_string()
+        }
+        "WebFetch" => {
+            let url = input.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            url.to_string()
+        }
+        "NotebookEdit" => {
+            let path = input
+                .get("notebook_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let cell_id = input.get("cell_id").and_then(|v| v.as_str());
+            match cell_id {
+                Some(id) if !id.is_empty() => format!("{path} [{id}]"),
+                _ => path.to_string(),
+            }
+        }
+        "MultiEdit" => {
+            let path = input
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let n = input
+                .get("edits")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0);
+            format!("{path} ({n} edits)")
+        }
+        "ExitPlanMode" => {
+            let plan = input.get("plan").and_then(|v| v.as_str()).unwrap_or("");
+            format!("plan: {}", truncate_chars(plan, 60))
+        }
+        "Skill" => {
+            let skill = input.get("skill").and_then(|v| v.as_str()).unwrap_or("");
+            let args = input.get("args").and_then(|v| v.as_str()).unwrap_or("");
+            if args.is_empty() {
+                skill.to_string()
+            } else {
+                format!("{skill} {args}")
+            }
+        }
+        "AskUserQuestion" => {
+            let question = input
+                .get("questions")
+                .and_then(|v| v.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|q| q.get("question"))
+                .and_then(|q| q.as_str())
+                .unwrap_or("");
+            truncate_chars(question, 60)
+        }
+        name if name.starts_with("mcp__") => {
+            let parts: Vec<&str> = name.splitn(3, "__").collect();
+            let server = parts.get(1).copied().unwrap_or("");
+            let tool = parts.get(2).copied().unwrap_or("");
+            let compact = truncate_chars(&serde_json::to_string(&input).unwrap_or_default(), 80);
+            format!("[{server}] {tool}: {compact}")
         }
         _ => serde_json::to_string(&input).unwrap_or_default(),
     }
@@ -285,6 +407,96 @@ fn parse_system(
     )]
 }
 
+fn parse_summary(
+    v: &Value,
+    timestamp: &str,
+    agent_name: &str,
+    agent_color: Option<&str>,
+) -> Vec<LogEntry> {
+    let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+    if summary.is_empty() {
+        return vec![];
+    }
+    vec![LogEntry::new(
+        timestamp,
+        agent_name,
+        agent_color,
+        EntryType::Summary,
+        summary.to_string(),
+    )]
+}
+
+fn parse_result(
+    v: &Value,
+    timestamp: &str,
+    agent_name: &str,
+    agent_color: Option<&str>,
+) -> Vec<LogEntry> {
+    let subtype = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+    let num_turns = v.get("num_turns").and_then(|n| n.as_u64());
+    let total_cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
+    let is_error = v.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false);
+
+    let content = if !subtype.is_empty() || num_turns.is_some() || total_cost.is_some() {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(n) = num_turns {
+            parts.push(format!("turns={n}"));
+        }
+        if let Some(c) = total_cost {
+            parts.push(format!("cost=${c:.2}"));
+        }
+        if parts.is_empty() {
+            format!("session result: {subtype}")
+        } else {
+            format!("session result: {subtype} ({})", parts.join(", "))
+        }
+    } else {
+        v.get("result")
+            .and_then(|r| r.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+
+    if content.is_empty() {
+        return vec![];
+    }
+
+    vec![
+        LogEntry::new(
+            timestamp,
+            agent_name,
+            agent_color,
+            EntryType::Result,
+            content,
+        )
+        .with_error(is_error),
+    ]
+}
+
+fn parse_snapshot(
+    v: &Value,
+    timestamp: &str,
+    agent_name: &str,
+    agent_color: Option<&str>,
+) -> Vec<LogEntry> {
+    let is_update = v
+        .get("isSnapshotUpdate")
+        .and_then(|b| b.as_bool())
+        .unwrap_or(false);
+    let content = if is_update {
+        "[git snapshot] (update)".to_string()
+    } else {
+        "[git snapshot]".to_string()
+    };
+    vec![LogEntry::new(
+        timestamp,
+        agent_name,
+        agent_color,
+        EntryType::Snapshot,
+        content,
+    )]
+}
+
 fn extract_tool_result_content(block: &Value) -> String {
     match block.get("content") {
         Some(Value::String(s)) => s.clone(),
@@ -353,11 +565,128 @@ mod tests {
     }
 
     #[test]
-    fn skip_thinking_blocks() {
+    fn parse_thinking_block() {
         let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"thinking","thinking":"hmm","signature":"sig"},{"type":"text","text":"answer"}]}}"#;
         let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message_type, EntryType::Thinking);
+        assert_eq!(entries[0].content, "hmm");
+        assert_eq!(entries[1].message_type, EntryType::Assistant);
+        assert_eq!(entries[1].content, "answer");
+    }
+
+    #[test]
+    fn parse_redacted_thinking_block() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"redacted_thinking","data":"xyz"},{"type":"text","text":"answer"}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].message_type, EntryType::Thinking);
+        assert_eq!(entries[0].content, "[redacted thinking]");
+        assert_eq!(entries[1].message_type, EntryType::Assistant);
+    }
+
+    #[test]
+    fn parse_summary_message() {
+        let line = r#"{"type":"summary","summary":"Conversation compacted","leafUuid":"abc","timestamp":"2026-04-12T08:46:49.067Z"}"#;
+        let entries = parse_line(line, "a", None);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].message_type, EntryType::Assistant);
+        assert_eq!(entries[0].message_type, EntryType::Summary);
+        assert_eq!(entries[0].content, "Conversation compacted");
+    }
+
+    #[test]
+    fn parse_summary_missing_timestamp() {
+        let line = r#"{"type":"summary","summary":"S","leafUuid":"abc"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].timestamp, "");
+    }
+
+    #[test]
+    fn parse_result_message() {
+        let line = r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0.1234,"duration_ms":1200,"num_turns":5,"timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::Result);
+        assert!(entries[0].content.contains("session result: success"));
+        assert!(entries[0].content.contains("turns=5"));
+        assert!(entries[0].content.contains("cost=$0.12"));
+    }
+
+    #[test]
+    fn parse_result_fallback_to_text() {
+        let line = r#"{"type":"result","result":"done","timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::Result);
+        assert_eq!(entries[0].content, "done");
+    }
+
+    #[test]
+    fn parse_snapshot_message() {
+        let line =
+            r#"{"type":"file-history-snapshot","messageId":"m","snapshot":{},"timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::Snapshot);
+        assert_eq!(entries[0].content, "[git snapshot]");
+    }
+
+    #[test]
+    fn parse_snapshot_update() {
+        let line = r#"{"type":"file-history-snapshot","messageId":"m","isSnapshotUpdate":true,"snapshot":{},"timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::Snapshot);
+        assert!(entries[0].content.contains("update"));
+    }
+
+    #[test]
+    fn tool_use_task_summary() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"Task","input":{"subagent_type":"explore","description":"Look at parser","prompt":"ignored"}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "explore: Look at parser");
+    }
+
+    #[test]
+    fn tool_use_todo_write_summary() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[{"status":"in_progress"},{"status":"pending"},{"status":"completed"}]}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "3 todos (1 in progress)");
+    }
+
+    #[test]
+    fn tool_use_todo_write_empty() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"TodoWrite","input":{"todos":[]}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "todos cleared");
+    }
+
+    #[test]
+    fn tool_use_web_search_summary() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"WebSearch","input":{"query":"rust async traits"}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "rust async traits");
+    }
+
+    #[test]
+    fn tool_use_mcp_namespace() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"mcp__github__get_me","input":{"x":1}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.starts_with("[github] get_me: "));
+    }
+
+    #[test]
+    fn tool_use_multi_edit_summary() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"MultiEdit","input":{"file_path":"/a/b.rs","edits":[{},{}]}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "/a/b.rs (2 edits)");
     }
 
     #[test]
