@@ -36,6 +36,89 @@ pub struct LogEntry {
     /// Usage statistics (input/output/cache tokens) for assistant messages.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub usage: Option<Usage>,
+    /// Kind of injected XML-like tag found in the content (e.g. slash command,
+    /// hook output, system reminder). Only populated for User/Assistant text
+    /// blocks whose content starts with or contains a recognised tag.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub tag: Option<TagKind>,
+}
+
+/// Classification of XML-like tags injected by Claude Code into
+/// user/assistant text content (not written by the user themselves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum TagKind {
+    /// `<command-name>` / `<command-message>` / `<command-args>` — slash
+    /// command invocation metadata.
+    SlashCommand,
+    /// `<*-hook>` variants (user-prompt-submit-hook, pre-tool-use-hook,
+    /// post-tool-use-hook).
+    Hook,
+    /// `<system-reminder>` — auto-injected system reminders.
+    SystemReminder,
+    /// `<ide-selection>` / `<ide-diagnostic>` — IDE context.
+    Ide,
+    /// `<local-command-stdout>` and `<bash-input>` / `<bash-stdout>` /
+    /// `<bash-stderr>` — inline shell context.
+    Bash,
+}
+
+/// Map an XML-like tag name (without angle brackets) to its `TagKind`.
+/// Returns `None` for any tag we don't explicitly recognise, so unrelated
+/// HTML-ish content in messages doesn't accidentally get tagged.
+pub fn classify_tag(tag_name: &str) -> Option<TagKind> {
+    match tag_name {
+        "command-name" | "command-message" | "command-args" => Some(TagKind::SlashCommand),
+        "user-prompt-submit-hook" | "pre-tool-use-hook" | "post-tool-use-hook" => {
+            Some(TagKind::Hook)
+        }
+        "system-reminder" => Some(TagKind::SystemReminder),
+        "ide-selection" | "ide-diagnostic" => Some(TagKind::Ide),
+        "local-command-stdout" | "bash-input" | "bash-stdout" | "bash-stderr" => {
+            Some(TagKind::Bash)
+        }
+        _ => None,
+    }
+}
+
+/// Scan `text` for the first recognised opening tag and return
+/// `(kind, tag_name)`. The scan is allocation-free: we walk each `<...>`
+/// occurrence and compare the raw name against the known set.
+///
+/// Only *opening* tags are matched (i.e. not `</foo>` and not self-closing
+/// `<foo/>`), and only tags whose name contains alphanum/`-`/`_` characters.
+pub fn detect_first_tag(text: &str) -> Option<(TagKind, &str)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        // Advance to the next '<'.
+        let rel = text[i..].find('<')?;
+        let start = i + rel;
+        let after = start + 1;
+        if after >= bytes.len() {
+            return None;
+        }
+        // Skip closing tags `</…>` — we only care about openings.
+        if bytes[after] == b'/' {
+            i = after + 1;
+            continue;
+        }
+        // Find the closing '>' of this tag.
+        let rel_end = text[after..].find('>')?;
+        let end = after + rel_end;
+        let raw_name = &text[after..end];
+        // A recognised tag name is ASCII lower-case with '-'; strip any
+        // attribute suffix by splitting on whitespace.
+        let name = raw_name
+            .split(|c: char| c.is_ascii_whitespace())
+            .next()
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if let Some(kind) = classify_tag(name) {
+            return Some((kind, name));
+        }
+        i = end + 1;
+    }
+    None
 }
 
 /// Token-usage metadata carried on assistant records.
@@ -94,11 +177,17 @@ impl LogEntry {
             model: None,
             stop_reason: None,
             usage: None,
+            tag: None,
         }
     }
 
     fn with_tool(mut self, name: &str) -> Self {
         self.tool_name = Some(name.to_string());
+        self
+    }
+
+    fn with_tag(mut self, tag: Option<TagKind>) -> Self {
+        self.tag = tag;
         self
     }
 
@@ -261,6 +350,7 @@ fn parse_assistant(
             "text" => {
                 let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 if !text.is_empty() {
+                    let tag = detect_first_tag(text).map(|(k, _)| k);
                     entries.push(
                         LogEntry::new(
                             timestamp,
@@ -269,7 +359,8 @@ fn parse_assistant(
                             EntryType::Assistant,
                             text.to_string(),
                         )
-                        .with_meta(meta),
+                        .with_meta(meta)
+                        .with_tag(tag),
                     );
                 }
             }
@@ -485,6 +576,7 @@ fn parse_user(
             if s.is_empty() {
                 return vec![];
             }
+            let tag = detect_first_tag(s).map(|(k, _)| k);
             vec![
                 LogEntry::new(
                     timestamp,
@@ -493,44 +585,89 @@ fn parse_user(
                     EntryType::User,
                     s.clone(),
                 )
-                .with_meta(meta),
+                .with_meta(meta)
+                .with_tag(tag),
             ]
         }
         Value::Array(arr) => {
             let mut entries = Vec::new();
             for block in arr {
                 let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                if block_type == "tool_result" {
-                    let is_error = block
-                        .get("is_error")
-                        .and_then(|e| e.as_bool())
-                        .unwrap_or(false);
-                    let result_content = extract_tool_result_content(block);
-                    entries.push(
-                        LogEntry::new(
-                            timestamp,
-                            agent_name,
-                            agent_color,
-                            EntryType::ToolResult,
-                            result_content,
-                        )
-                        .with_error(is_error)
-                        .with_meta(meta),
-                    );
-                } else if block_type == "text" {
-                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    if !text.is_empty() {
+                match block_type {
+                    "tool_result" => {
+                        let is_error = block
+                            .get("is_error")
+                            .and_then(|e| e.as_bool())
+                            .unwrap_or(false);
+                        let result_content = extract_tool_result_content(block);
+                        entries.push(
+                            LogEntry::new(
+                                timestamp,
+                                agent_name,
+                                agent_color,
+                                EntryType::ToolResult,
+                                result_content,
+                            )
+                            .with_error(is_error)
+                            .with_meta(meta),
+                        );
+                    }
+                    "text" => {
+                        let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                        if !text.is_empty() {
+                            let tag = detect_first_tag(text).map(|(k, _)| k);
+                            entries.push(
+                                LogEntry::new(
+                                    timestamp,
+                                    agent_name,
+                                    agent_color,
+                                    EntryType::User,
+                                    text.to_string(),
+                                )
+                                .with_meta(meta)
+                                .with_tag(tag),
+                            );
+                        }
+                    }
+                    "image" => {
+                        let media = block
+                            .pointer("/source/media_type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("image");
                         entries.push(
                             LogEntry::new(
                                 timestamp,
                                 agent_name,
                                 agent_color,
                                 EntryType::User,
-                                text.to_string(),
+                                format!("[image: {media}]"),
                             )
                             .with_meta(meta),
                         );
                     }
+                    "document" => {
+                        // Prefer filename, then media_type, else a generic label.
+                        let filename = block
+                            .get("filename")
+                            .or_else(|| block.pointer("/source/filename"))
+                            .and_then(|v| v.as_str());
+                        let label = filename
+                            .or_else(|| {
+                                block.pointer("/source/media_type").and_then(|v| v.as_str())
+                            })
+                            .unwrap_or("document");
+                        entries.push(
+                            LogEntry::new(
+                                timestamp,
+                                agent_name,
+                                agent_color,
+                                EntryType::User,
+                                format!("[document: {label}]"),
+                            )
+                            .with_meta(meta),
+                        );
+                    }
+                    _ => {}
                 }
             }
             entries
@@ -993,6 +1130,91 @@ mod tests {
             json.contains("\"parentUuid\":\"p0\""),
             "parentUuid should serialise in camelCase: {json}"
         );
+    }
+
+    #[test]
+    fn classify_tag_recognises_known_tags() {
+        assert_eq!(classify_tag("command-name"), Some(TagKind::SlashCommand));
+        assert_eq!(classify_tag("command-message"), Some(TagKind::SlashCommand));
+        assert_eq!(classify_tag("command-args"), Some(TagKind::SlashCommand));
+        assert_eq!(classify_tag("user-prompt-submit-hook"), Some(TagKind::Hook));
+        assert_eq!(classify_tag("pre-tool-use-hook"), Some(TagKind::Hook));
+        assert_eq!(classify_tag("post-tool-use-hook"), Some(TagKind::Hook));
+        assert_eq!(
+            classify_tag("system-reminder"),
+            Some(TagKind::SystemReminder)
+        );
+        assert_eq!(classify_tag("ide-selection"), Some(TagKind::Ide));
+        assert_eq!(classify_tag("ide-diagnostic"), Some(TagKind::Ide));
+        assert_eq!(classify_tag("local-command-stdout"), Some(TagKind::Bash));
+        assert_eq!(classify_tag("bash-input"), Some(TagKind::Bash));
+        assert_eq!(classify_tag("bash-stdout"), Some(TagKind::Bash));
+        assert_eq!(classify_tag("bash-stderr"), Some(TagKind::Bash));
+        assert_eq!(classify_tag("unknown-thing"), None);
+        assert_eq!(classify_tag(""), None);
+    }
+
+    #[test]
+    fn detect_first_tag_returns_none_for_untagged_text() {
+        assert!(detect_first_tag("plain text with no tags").is_none());
+        // Unknown tag — must not be classified.
+        assert!(detect_first_tag("<foo>body</foo>").is_none());
+        // Closing tag alone — must not be matched.
+        assert!(detect_first_tag("</system-reminder>").is_none());
+    }
+
+    #[test]
+    fn detect_first_tag_finds_system_reminder() {
+        let (kind, name) =
+            detect_first_tag("prefix <system-reminder>be nice</system-reminder> suffix").unwrap();
+        assert_eq!(kind, TagKind::SystemReminder);
+        assert_eq!(name, "system-reminder");
+    }
+
+    #[test]
+    fn detect_first_tag_returns_first_match() {
+        let (kind, _) = detect_first_tag(
+            "<command-name>/foo</command-name><system-reminder>x</system-reminder>",
+        )
+        .unwrap();
+        assert_eq!(kind, TagKind::SlashCommand);
+    }
+
+    #[test]
+    fn user_text_block_with_system_reminder_tagged() {
+        let line = r#"{"type":"user","timestamp":"T","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>stay focused</system-reminder>"}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::User);
+        assert_eq!(entries[0].tag, Some(TagKind::SystemReminder));
+        // Content must remain the raw text — we do not strip tags.
+        assert!(entries[0].content.contains("<system-reminder>"));
+    }
+
+    #[test]
+    fn user_image_block_emits_placeholder() {
+        let line = r#"{"type":"user","timestamp":"T","message":{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::User);
+        assert_eq!(entries[0].content, "[image: image/png]");
+    }
+
+    #[test]
+    fn user_document_block_emits_placeholder() {
+        let line = r#"{"type":"user","timestamp":"T","message":{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"..."},"filename":"paper.pdf"}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::User);
+        assert_eq!(entries[0].content, "[document: paper.pdf]");
+    }
+
+    #[test]
+    fn assistant_text_with_slash_command_tagged() {
+        let line = r#"{"type":"assistant","timestamp":"T","message":{"role":"assistant","content":[{"type":"text","text":"<command-name>/compact</command-name>"}]}}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tag, Some(TagKind::SlashCommand));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 
 use crossterm::style::{Color, Stylize};
 
-use crate::parser::{EntryType, LogEntry, Usage, format_timestamp};
+use crate::parser::{EntryType, LogEntry, TagKind, Usage, format_timestamp};
 
 /// Format a LogEntry for terminal output.
 ///
@@ -146,13 +146,52 @@ fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
             format!("{prefix}{}", entry.content)
         }
         _ => {
-            if entry.is_error {
+            let tag_prefix = match entry.message_type {
+                EntryType::User | EntryType::Assistant => tag_prefix(entry.tag, no_color),
+                _ => String::new(),
+            };
+            let body = if entry.is_error {
                 let icon = if no_color { "[err]" } else { "\u{f071}" };
                 format!("{icon} {}", entry.content)
             } else {
                 entry.content.clone()
+            };
+            if tag_prefix.is_empty() {
+                body
+            } else {
+                format!("{tag_prefix} {body}")
             }
         }
+    }
+}
+
+/// Build a short dim-styled glyph indicating the kind of injected tag carried
+/// by a user/assistant text entry. Returns an empty string when `tag` is None.
+fn tag_prefix(tag: Option<TagKind>, no_color: bool) -> String {
+    let Some(kind) = tag else {
+        return String::new();
+    };
+    let glyph = if no_color {
+        match kind {
+            TagKind::SlashCommand => "/",
+            TagKind::Hook => "[hook]",
+            TagKind::SystemReminder => "[reminder]",
+            TagKind::Ide => "[ide]",
+            TagKind::Bash => "$",
+        }
+    } else {
+        match kind {
+            TagKind::SlashCommand => "/",
+            TagKind::Hook => "\u{2699}",
+            TagKind::SystemReminder => "\u{24d8}",
+            TagKind::Ide => "\u{2318}",
+            TagKind::Bash => "$",
+        }
+    };
+    if no_color {
+        glyph.to_string()
+    } else {
+        glyph.with(Color::DarkGrey).to_string()
     }
 }
 
@@ -234,6 +273,9 @@ fn compact_entry(entry: &LogEntry) -> LogEntry {
     let content = match entry.message_type {
         EntryType::ToolResult => truncate_lines(&entry.content, 3),
         EntryType::Assistant | EntryType::Thinking => truncate_chars(&entry.content, 200),
+        // Image/document placeholders (e.g. "[image: image/png]") are already
+        // compact — don't truncate them.
+        EntryType::User if !entry.content.starts_with('[') => truncate_chars(&entry.content, 200),
         _ => entry.content.clone(),
     };
     LogEntry {
@@ -299,6 +341,7 @@ mod tests {
             model: None,
             stop_reason: None,
             usage: None,
+            tag: None,
         }
     }
 
@@ -611,5 +654,54 @@ mod tests {
             !output.contains(" · "),
             "no metadata suffix expected when fields are None: {output:?}"
         );
+    }
+
+    #[test]
+    fn test_format_entry_slash_command_prefix_no_color() {
+        let mut entry = make_entry(EntryType::User, "<command-name>/compact</command-name>");
+        entry.tag = Some(TagKind::SlashCommand);
+        let output = format_entry(&entry, false, true, 10, false);
+        // no_color slash-command glyph is "/"
+        assert!(
+            output.contains("/ <command-name>"),
+            "expected slash prefix in no_color mode: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_entry_hook_prefix_no_color() {
+        let mut entry = make_entry(
+            EntryType::User,
+            "<user-prompt-submit-hook>hook fired</user-prompt-submit-hook>",
+        );
+        entry.tag = Some(TagKind::Hook);
+        let output = format_entry(&entry, false, true, 10, false);
+        assert!(
+            output.contains("[hook]"),
+            "expected '[hook]' prefix in no_color mode: {output:?}"
+        );
+        assert!(output.contains("hook fired"));
+    }
+
+    #[test]
+    fn test_format_entry_reminder_prefix_no_color() {
+        let mut entry = make_entry(
+            EntryType::User,
+            "<system-reminder>stay focused</system-reminder>",
+        );
+        entry.tag = Some(TagKind::SystemReminder);
+        let output = format_entry(&entry, false, true, 10, false);
+        assert!(
+            output.contains("[reminder]"),
+            "expected '[reminder]' prefix in no_color mode: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_compact_entry_preserves_image_placeholder() {
+        let entry = make_entry(EntryType::User, "[image: image/png]");
+        let json = format_entry_json(&entry, false);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["content"].as_str().unwrap(), "[image: image/png]");
     }
 }

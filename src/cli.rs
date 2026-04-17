@@ -112,4 +112,12 @@ pub enum MessageType {
     Summary,
     Result,
     Snapshot,
+    /// Match User/Assistant entries whose content carries a recognised
+    /// slash-command tag (e.g. `<command-name>`).
+    SlashCommand,
+    /// Match User/Assistant entries whose content carries a `*-hook` tag.
+    Hook,
+    /// Match User/Assistant entries whose content carries a
+    /// `<system-reminder>` tag.
+    Reminder,
 }

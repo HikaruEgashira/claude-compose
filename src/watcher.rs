@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use crate::cli::{LogsOpts, MessageType};
 use crate::format::{format_entry, format_entry_json};
 use crate::parser::{
-    EntryType, LogEntry, TeamConfig, claude_home, cwd_to_project_key, discover_member_sessions,
-    load_team_config, parse_line, project_log_dir, read_subagent_name,
+    EntryType, LogEntry, TagKind, TeamConfig, claude_home, cwd_to_project_key,
+    discover_member_sessions, load_team_config, parse_line, project_log_dir, read_subagent_name,
     resolve_member_session_via_tmux,
 };
 
@@ -113,7 +113,7 @@ fn tail_entries(
 
     let start = all_entries.len().saturating_sub(opts.tail);
     for entry in &all_entries[start..] {
-        if !matches_filter(&entry.message_type, &opts.type_filter) {
+        if !matches_filter(entry, &opts.type_filter) {
             continue;
         }
         if should_skip_thinking(&entry.message_type, opts) {
@@ -234,7 +234,7 @@ async fn follow_events(
             let af = &mut agent_files[idx];
             let new_entries = read_new_lines(af)?;
             for entry in new_entries {
-                if !matches_filter(&entry.message_type, &opts.type_filter) {
+                if !matches_filter(&entry, &opts.type_filter) {
                     continue;
                 }
                 if should_skip_thinking(&entry.message_type, opts) {
@@ -732,10 +732,27 @@ fn color_for_name(name: &str) -> String {
     DEFAULT_COLORS[(hash as usize) % DEFAULT_COLORS.len()].to_string()
 }
 
-fn matches_filter(entry_type: &EntryType, filter: &Option<MessageType>) -> bool {
+fn matches_filter(entry: &LogEntry, filter: &Option<MessageType>) -> bool {
     let Some(f) = filter else { return true };
+    // Tag-based filters match User/Assistant entries that carry a specific
+    // TagKind. They are independent of the base EntryType mapping below
+    // (EntryType::User / Assistant continue to match --type user/assistant
+    // for tagged entries too).
+    let is_user_or_assistant = matches!(entry.message_type, EntryType::User | EntryType::Assistant);
+    match f {
+        MessageType::SlashCommand => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::SlashCommand);
+        }
+        MessageType::Hook => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::Hook);
+        }
+        MessageType::Reminder => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::SystemReminder);
+        }
+        _ => {}
+    }
     matches!(
-        (f, entry_type),
+        (f, &entry.message_type),
         (MessageType::Assistant, EntryType::Assistant)
             | (MessageType::User, EntryType::User)
             | (MessageType::System, EntryType::System)
@@ -870,36 +887,123 @@ mod tests {
         }
     }
 
+    fn make_entry_for_filter(kind: EntryType) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "a".to_string(),
+            agent_color: None,
+            message_type: kind,
+            content: String::new(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain: false,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
+            tag: None,
+        }
+    }
+
     #[test]
     fn matches_filter_none_passes_all() {
-        assert!(matches_filter(&EntryType::Thinking, &None));
-        assert!(matches_filter(&EntryType::Summary, &None));
-        assert!(matches_filter(&EntryType::Result, &None));
-        assert!(matches_filter(&EntryType::Snapshot, &None));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Thinking),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Summary),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Result),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Snapshot),
+            &None
+        ));
     }
 
     #[test]
     fn matches_filter_maps_new_variants() {
         assert!(matches_filter(
-            &EntryType::Thinking,
+            &make_entry_for_filter(EntryType::Thinking),
             &Some(MessageType::Thinking)
         ));
         assert!(matches_filter(
-            &EntryType::Summary,
+            &make_entry_for_filter(EntryType::Summary),
             &Some(MessageType::Summary)
         ));
         assert!(matches_filter(
-            &EntryType::Result,
+            &make_entry_for_filter(EntryType::Result),
             &Some(MessageType::Result)
         ));
         assert!(matches_filter(
-            &EntryType::Snapshot,
+            &make_entry_for_filter(EntryType::Snapshot),
             &Some(MessageType::Snapshot)
         ));
         assert!(!matches_filter(
-            &EntryType::Assistant,
+            &make_entry_for_filter(EntryType::Assistant),
             &Some(MessageType::Thinking)
         ));
+    }
+
+    #[test]
+    fn filter_user_includes_tagged_entries() {
+        // A User entry that carries a slash-command tag should still match
+        // the plain --type user filter.
+        let mut entry = make_entry_for_filter(EntryType::User);
+        entry.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&entry, &Some(MessageType::User)));
+    }
+
+    #[test]
+    fn filter_slash_command_includes_tagged_entries() {
+        let mut user = make_entry_for_filter(EntryType::User);
+        user.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&user, &Some(MessageType::SlashCommand)));
+
+        let mut assistant = make_entry_for_filter(EntryType::Assistant);
+        assistant.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&assistant, &Some(MessageType::SlashCommand)));
+
+        // A non-slash-command tag must NOT match --type slash-command.
+        let mut hook = make_entry_for_filter(EntryType::User);
+        hook.tag = Some(TagKind::Hook);
+        assert!(!matches_filter(&hook, &Some(MessageType::SlashCommand)));
+    }
+
+    #[test]
+    fn filter_hook_excludes_untagged_entries() {
+        // Untagged user entry must not match --type hook.
+        let untagged = make_entry_for_filter(EntryType::User);
+        assert!(!matches_filter(&untagged, &Some(MessageType::Hook)));
+
+        // Tagged with a *different* kind must not match.
+        let mut reminder = make_entry_for_filter(EntryType::User);
+        reminder.tag = Some(TagKind::SystemReminder);
+        assert!(!matches_filter(&reminder, &Some(MessageType::Hook)));
+
+        // Tool-use entries never carry tags and must not match tag filters.
+        let tool = make_entry_for_filter(EntryType::ToolUse);
+        assert!(!matches_filter(&tool, &Some(MessageType::Hook)));
+
+        // A properly hook-tagged entry passes.
+        let mut hook = make_entry_for_filter(EntryType::User);
+        hook.tag = Some(TagKind::Hook);
+        assert!(matches_filter(&hook, &Some(MessageType::Hook)));
+    }
+
+    #[test]
+    fn filter_reminder_matches_system_reminder_tag() {
+        let mut reminder = make_entry_for_filter(EntryType::User);
+        reminder.tag = Some(TagKind::SystemReminder);
+        assert!(matches_filter(&reminder, &Some(MessageType::Reminder)));
+
+        let untagged = make_entry_for_filter(EntryType::User);
+        assert!(!matches_filter(&untagged, &Some(MessageType::Reminder)));
     }
 
     #[test]
@@ -938,6 +1042,7 @@ mod tests {
             model: None,
             stop_reason: None,
             usage: None,
+            tag: None,
         }
     }
 
@@ -1189,6 +1294,7 @@ mod tests {
             model: None,
             stop_reason: None,
             usage: None,
+            tag: None,
         }
     }
 
