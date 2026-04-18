@@ -74,6 +74,18 @@ fn append_usage_parts(usage: &Usage, parts: &mut Vec<String>) {
     if let Some(n) = usage.cache_read_input_tokens {
         parts.push(format!("cache_r={n}"));
     }
+    // Only surface the TTL breakdown when it's actually present — most
+    // assistant records carry only the flat total, so most lines skip
+    // these entirely.
+    if let Some(n) = usage.cache_creation_1h_input_tokens {
+        parts.push(format!("cache_1h={n}"));
+    }
+    if let Some(n) = usage.cache_creation_5m_input_tokens {
+        parts.push(format!("cache_5m={n}"));
+    }
+    if let Some(n) = usage.web_search_requests {
+        parts.push(format!("web={n}"));
+    }
 }
 
 /// Build a leading-space, dim-styled metadata tail summarising model and token
@@ -608,6 +620,7 @@ mod tests {
             output_tokens: Some(456),
             cache_creation_input_tokens: None,
             cache_read_input_tokens: Some(1500),
+            ..Usage::default()
         });
         let output = format_entry(&entry, false, true, 10, true);
         assert!(
@@ -636,6 +649,7 @@ mod tests {
             output_tokens: Some(8),
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            ..Usage::default()
         });
         let output = format_entry(&entry, false, true, 10, false);
         assert!(
@@ -658,6 +672,7 @@ mod tests {
             output_tokens: Some(2),
             cache_creation_input_tokens: None,
             cache_read_input_tokens: None,
+            ..Usage::default()
         });
         // verbose=true, show_metadata=false — metadata suffix should still
         // appear because verbose implies full detail.

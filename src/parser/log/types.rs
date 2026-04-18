@@ -76,6 +76,21 @@ pub struct LogEntry {
     /// Correlates the record with the API request that produced it.
     #[serde(rename = "requestId", skip_serializing_if = "Option::is_none", default)]
     pub request_id: Option<String>,
+    /// Alternate parent-UUID chain that survives auto-compaction. Claude Code
+    /// (≥2026) sets this on synthetic summary messages so cross-boundary
+    /// threading still works when `parentUuid` points at a record that lives
+    /// on the discarded side of a compact boundary.
+    #[serde(
+        rename = "logicalParentUuid",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    pub logical_parent_uuid: Option<String>,
+    /// True on the synthetic `user` record Claude Code injects after auto-
+    /// compaction to carry the prior-transcript summary. Lets filters
+    /// distinguish these from actual human input.
+    #[serde(rename = "isCompactSummary", default, skip_serializing_if = "is_false")]
+    pub is_compact_summary: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -128,6 +143,18 @@ pub struct Usage {
         skip_serializing_if = "Option::is_none"
     )]
     pub cache_read_input_tokens: Option<u64>,
+    /// Cache-creation tokens written to the 1-hour ephemeral tier. Lifted
+    /// from nested `cache_creation.ephemeral_1h_input_tokens` so the
+    /// downstream schema stays flat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_1h_input_tokens: Option<u64>,
+    /// Cache-creation tokens written to the 5-minute ephemeral tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_5m_input_tokens: Option<u64>,
+    /// Billable WebSearch requests issued via `server_tool_use`. Lifted
+    /// from nested `server_tool_use.web_search_requests`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_search_requests: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -180,6 +207,8 @@ impl LogEntry {
             is_meta: false,
             is_api_error: false,
             request_id: None,
+            logical_parent_uuid: None,
+            is_compact_summary: false,
         }
     }
 
@@ -213,6 +242,8 @@ impl LogEntry {
         self.is_meta = meta.is_meta;
         self.is_api_error = meta.is_api_error;
         self.request_id = meta.request_id.clone();
+        self.logical_parent_uuid = meta.logical_parent_uuid.clone();
+        self.is_compact_summary = meta.is_compact_summary;
         self
     }
 }
@@ -260,10 +291,48 @@ mod tests {
             output_tokens: Some(20),
             cache_creation_input_tokens: Some(30),
             cache_read_input_tokens: Some(40),
+            ..Usage::default()
         };
         let json = serde_json::to_string(&u).unwrap();
         assert!(json.contains("\"cache_creation_input_tokens\":30"));
         assert!(json.contains("\"cache_read_input_tokens\":40"));
+    }
+
+    #[test]
+    fn usage_tiered_cache_and_web_search_serialise() {
+        let u = Usage {
+            cache_creation_1h_input_tokens: Some(100),
+            cache_creation_5m_input_tokens: Some(200),
+            web_search_requests: Some(3),
+            ..Usage::default()
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("\"cache_creation_1h_input_tokens\":100"));
+        assert!(json.contains("\"cache_creation_5m_input_tokens\":200"));
+        assert!(json.contains("\"web_search_requests\":3"));
+    }
+
+    #[test]
+    fn logical_parent_uuid_and_compact_summary_serialise() {
+        let e = LogEntry {
+            logical_parent_uuid: Some("lp-1".into()),
+            is_compact_summary: true,
+            ..LogEntry::default()
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(
+            json.contains("\"logicalParentUuid\":\"lp-1\""),
+            "logicalParentUuid should serialise in camelCase: {json}"
+        );
+        assert!(json.contains("\"isCompactSummary\":true"));
+    }
+
+    #[test]
+    fn new_boolean_fields_skipped_when_default() {
+        let e = LogEntry::default();
+        let json = serde_json::to_string(&e).unwrap();
+        assert!(!json.contains("isCompactSummary"));
+        assert!(!json.contains("logicalParentUuid"));
     }
 
     #[test]
