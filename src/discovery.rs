@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::parser::claude_home;
+use crate::parser::{claude_home, cwd_to_project_key};
 
 /// Per-session summary of TodoWrite state, bucketed by status.
 #[derive(Debug, Clone, Serialize, Default)]
@@ -26,6 +26,46 @@ impl TodoSummary {
 pub struct IdeAttachment {
     pub ide_name: String,
     pub workspace: String,
+}
+
+/// Per-project artefact counts sourced from
+/// `~/.claude/projects/<project_key>/{memory,file-history}/`.
+///
+/// Both trees are optional (older Claude Code installs don't create them)
+/// so either count may be zero without implying absence of activity.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ProjectArtifacts {
+    pub memory_files: usize,
+    pub file_history_snapshots: usize,
+}
+
+impl ProjectArtifacts {
+    pub fn is_empty(&self) -> bool {
+        self.memory_files == 0 && self.file_history_snapshots == 0
+    }
+}
+
+/// Summary of the harness-level configuration read from
+/// `~/.claude/settings.json` (or a project-local settings file).
+///
+/// We capture just the shape needed by downstream tooling (`ps`): which
+/// hook events are configured, and a count of permission rules. The raw
+/// JSON is intentionally *not* surfaced — downstream code should read the
+/// file directly if it needs the full shape.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct SettingsSummary {
+    /// Hook event names (e.g. `PreToolUse`, `PostToolUse`, `SessionStart`).
+    /// Sorted deterministically so two runs on the same file produce the
+    /// same ordering.
+    pub hooks: Vec<String>,
+    /// Number of entries under `permissions.allow`/`deny`/`ask` combined.
+    pub permission_rules: usize,
+}
+
+impl SettingsSummary {
+    pub fn is_empty(&self) -> bool {
+        self.hooks.is_empty() && self.permission_rules == 0
+    }
 }
 
 /// Derive the "session stem" from a todos filename.
@@ -165,6 +205,86 @@ pub fn load_ide_attachments_from(base: &Path) -> HashMap<String, IdeAttachment> 
     }
 
     out
+}
+
+/// Count artefact files under the memory/ and file-history/ subdirectories
+/// of a single project. Counts only the top level so large checkpoint
+/// trees don't stall discovery; `ps` needs a rough signal, not a census.
+pub fn load_project_artifacts(project_key: &str) -> ProjectArtifacts {
+    let Ok(claude) = claude_home() else {
+        return ProjectArtifacts::default();
+    };
+    load_project_artifacts_from(&claude.join("projects").join(project_key))
+}
+
+/// Same as [`load_project_artifacts`] but reads from an explicit project
+/// directory (the caller provides `~/.claude/projects/<key>` itself).
+pub fn load_project_artifacts_from(project_dir: &Path) -> ProjectArtifacts {
+    ProjectArtifacts {
+        memory_files: count_dir_entries(&project_dir.join("memory")),
+        file_history_snapshots: count_dir_entries(&project_dir.join("file-history")),
+    }
+}
+
+/// Look up artefacts by cwd. Convenience for the common call site in `ps`
+/// which carries the team's cwd rather than the derived project key.
+pub fn load_project_artifacts_for_cwd(cwd: &str) -> ProjectArtifacts {
+    load_project_artifacts(&cwd_to_project_key(cwd))
+}
+
+/// Count entries (files + directories) directly under `dir`. Returns 0
+/// when the directory is absent or unreadable — callers treat both as
+/// "no artefacts" rather than reporting an error.
+fn count_dir_entries(dir: &Path) -> usize {
+    match fs::read_dir(dir) {
+        Ok(entries) => entries.flatten().count(),
+        Err(_) => 0,
+    }
+}
+
+/// Read `~/.claude/settings.json` and extract the list of configured hook
+/// event names plus a count of permission rules. Returns an empty summary
+/// on any IO/parse failure (best-effort).
+pub fn load_settings_summary() -> SettingsSummary {
+    let Ok(claude) = claude_home() else {
+        return SettingsSummary::default();
+    };
+    load_settings_summary_from(&claude.join("settings.json"))
+}
+
+/// Same as [`load_settings_summary`] but reads from an explicit path.
+pub fn load_settings_summary_from(path: &Path) -> SettingsSummary {
+    let Ok(data) = fs::read_to_string(path) else {
+        return SettingsSummary::default();
+    };
+    let Ok(v) = serde_json::from_str::<Value>(&data) else {
+        return SettingsSummary::default();
+    };
+
+    // `hooks` is `{"<EventName>": [...]}`. We surface the sorted list of
+    // event names, which happens to be what `ps` wants to show.
+    let mut hooks: Vec<String> = v
+        .get("hooks")
+        .and_then(|h| h.as_object())
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default();
+    hooks.sort();
+
+    let permission_rules = v
+        .get("permissions")
+        .and_then(|p| p.as_object())
+        .map(|o| {
+            ["allow", "deny", "ask"]
+                .iter()
+                .filter_map(|k| o.get(*k).and_then(|v| v.as_array()).map(|a| a.len()))
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+
+    SettingsSummary {
+        hooks,
+        permission_rules,
+    }
 }
 
 /// Normalise a workspace path into an absolute string form when possible.
@@ -312,6 +432,88 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         let map = load_ide_attachments_from(&dir);
         assert!(map.is_empty());
+    }
+
+    #[test]
+    fn project_artifacts_counts_top_level_entries() {
+        let dir = std::env::temp_dir().join("cc-test-project-artifacts");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("memory")).unwrap();
+        fs::create_dir_all(dir.join("file-history")).unwrap();
+
+        fs::write(dir.join("memory/notes.md"), "hello").unwrap();
+        fs::write(dir.join("memory/goals.md"), "x").unwrap();
+        fs::create_dir_all(dir.join("file-history/abc")).unwrap();
+        fs::create_dir_all(dir.join("file-history/def")).unwrap();
+        fs::create_dir_all(dir.join("file-history/ghi")).unwrap();
+
+        let art = load_project_artifacts_from(&dir);
+        assert_eq!(art.memory_files, 2);
+        assert_eq!(art.file_history_snapshots, 3);
+        assert!(!art.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn project_artifacts_absent_dirs_return_zero() {
+        let dir = std::env::temp_dir().join("cc-test-project-artifacts-missing");
+        let _ = fs::remove_dir_all(&dir);
+        let art = load_project_artifacts_from(&dir);
+        assert_eq!(art.memory_files, 0);
+        assert_eq!(art.file_history_snapshots, 0);
+        assert!(art.is_empty());
+    }
+
+    #[test]
+    fn settings_summary_extracts_hook_names_and_counts() {
+        let dir = std::env::temp_dir().join("cc-test-settings-summary");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        fs::write(
+            &path,
+            r#"{
+                "hooks": {
+                    "PreToolUse": [{"matcher": "Bash"}],
+                    "PostToolUse": [],
+                    "SessionStart": [{"command": "echo hi"}]
+                },
+                "permissions": {
+                    "allow": ["Bash", "Read"],
+                    "deny": ["Write"],
+                    "ask": []
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let s = load_settings_summary_from(&path);
+        assert_eq!(s.hooks, vec!["PostToolUse", "PreToolUse", "SessionStart"]);
+        assert_eq!(s.permission_rules, 3);
+        assert!(!s.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_summary_missing_file_is_empty() {
+        let s = load_settings_summary_from(Path::new(
+            "/tmp/cc-settings-never-exists-xyz/settings.json",
+        ));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn settings_summary_malformed_is_empty() {
+        let dir = std::env::temp_dir().join("cc-test-settings-malformed");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        fs::write(&path, "not json").unwrap();
+        assert!(load_settings_summary_from(&path).is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

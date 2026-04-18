@@ -3,7 +3,7 @@ use serde_json::Value;
 use super::meta::RecordMeta;
 use super::tags::detect_first_tag;
 use super::tools::extract_tool_use_summary;
-use super::types::{EntryType, LogEntry};
+use super::types::{EntryType, LogEntry, truncate_chars};
 
 pub(crate) fn parse_assistant(
     v: &Value,
@@ -38,15 +38,23 @@ pub(crate) fn parse_assistant(
                     );
                 }
             }
-            // `tool_use` and the server-hosted `server_tool_use` / `mcp_tool_use`
-            // variants all carry the same shape: a tool name plus an input
-            // object. We normalise them to a single ToolUse entry so the
-            // renderer doesn't have to know about the hosting distinction.
-            "tool_use" | "server_tool_use" | "mcp_tool_use" => {
+            // `tool_use` and the server-hosted `server_tool_use` /
+            // `mcp_tool_use` / `computer_use` variants all carry the same
+            // shape: a tool name plus an input object. We normalise them to
+            // a single ToolUse entry so the renderer doesn't have to know
+            // about the hosting distinction. `computer_use` blocks from
+            // Claude's desktop-control tool don't always carry a `name`
+            // field, so fall back to `"Computer"` in that case.
+            "tool_use" | "server_tool_use" | "mcp_tool_use" | "computer_use" => {
+                let fallback = if block_type == "computer_use" {
+                    "Computer"
+                } else {
+                    "unknown"
+                };
                 let name = block
                     .get("name")
                     .and_then(|n| n.as_str())
-                    .unwrap_or("unknown");
+                    .unwrap_or(fallback);
                 let content = extract_tool_use_summary(name, block);
                 entries.push(
                     LogEntry::new(
@@ -59,6 +67,25 @@ pub(crate) fn parse_assistant(
                     .with_tool(name)
                     .with_meta(meta),
                 );
+            }
+            // Citation annotations emitted alongside assistant text for
+            // grounded responses (web_search / file-based citations).
+            // Render as a single User-facing line so a reader can see the
+            // source without tying it to a specific text block index.
+            "citation" | "citations_delta" => {
+                let content = extract_citation(block);
+                if !content.is_empty() {
+                    entries.push(
+                        LogEntry::new(
+                            timestamp,
+                            agent_name,
+                            agent_color,
+                            EntryType::Assistant,
+                            content,
+                        )
+                        .with_meta(meta),
+                    );
+                }
             }
             // Server-hosted WebSearch / MCP results arrive as a result block
             // inline in the assistant message. Render as ToolResult so
@@ -248,8 +275,12 @@ pub(crate) fn parse_system(
         let trigger = v
             .pointer("/compactMetadata/trigger")
             .and_then(|t| t.as_str());
+        // Newer Claude Code builds shortened the token field to `preTokens`
+        // while older logs carry `preCompactTokens`. Accept either so the
+        // separator stays informative across versions.
         let pre_tokens = v
             .pointer("/compactMetadata/preCompactTokens")
+            .or_else(|| v.pointer("/compactMetadata/preTokens"))
             .and_then(|n| n.as_u64());
         let display = match (trigger, pre_tokens) {
             (Some(t), Some(n)) => format!("compact boundary: trigger={t}, pre_tokens={n}"),
@@ -413,6 +444,36 @@ fn extract_tool_result_content(block: &Value) -> String {
     }
 }
 
+/// Pull a human-readable label from a `citation` / `citations_delta` block.
+/// Prefers `cited_text` (quoted span) + a source URL/title; falls back to any
+/// URL or title alone so we always surface something for the reader.
+fn extract_citation(block: &Value) -> String {
+    let cited = block
+        .get("cited_text")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    // Citation blocks nest their origin under `source` (URL citations) or
+    // carry `title` / `url` at the top level (older shape). Support both.
+    let source = block.get("source").unwrap_or(block);
+    let url = source.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    let title = source.get("title").and_then(|v| v.as_str()).unwrap_or("");
+
+    let origin = match (title, url) {
+        ("", "") => String::new(),
+        ("", u) => u.to_string(),
+        (t, "") => t.to_string(),
+        (t, u) => format!("{t} ({u})"),
+    };
+
+    let cited = truncate_chars(cited, 120);
+    match (cited.as_str(), origin.as_str()) {
+        ("", "") => String::new(),
+        ("", o) => format!("[citation] {o}"),
+        (c, "") => format!("[citation] \u{201c}{c}\u{201d}"),
+        (c, o) => format!("[citation] \u{201c}{c}\u{201d} — {o}"),
+    }
+}
+
 /// Pull a human-readable summary from a server-hosted tool result block.
 ///
 /// WebSearch results arrive as `content[{type: "web_search_result", ...}]`;
@@ -527,6 +588,83 @@ mod tests {
         assert_eq!(entries[0].message_type, EntryType::ToolResult);
         assert!(entries[0].content.contains("Tokio"));
         assert!(entries[0].content.contains("https://tokio.rs"));
+    }
+
+    #[test]
+    fn compact_boundary_accepts_pre_tokens_alias() {
+        // Newer Claude Code payloads shorten the field name from
+        // `preCompactTokens` to `preTokens`. Both must produce the same
+        // human-readable separator so the boundary stays informative.
+        let line = json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "compactMetadata": { "trigger": "manual", "preTokens": 12345 },
+            "timestamp": "T"
+        })
+        .to_string();
+        let entries = parse_line(&line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("trigger=manual"));
+        assert!(entries[0].content.contains("pre_tokens=12345"));
+    }
+
+    #[test]
+    fn assistant_computer_use_block_surfaces_as_toolcall() {
+        // Claude's desktop-control tool emits `computer_use` blocks. The
+        // block may omit `name`, in which case we default to "Computer".
+        let line = json!({
+            "type": "assistant",
+            "timestamp": "T",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    { "type": "computer_use", "input": { "action": "screenshot" } }
+                ]
+            }
+        })
+        .to_string();
+        let entries = parse_line(&line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].message_type, EntryType::ToolUse);
+        assert_eq!(entries[0].tool_name.as_deref(), Some("Computer"));
+    }
+
+    #[test]
+    fn assistant_citation_block_renders_origin() {
+        let line = json!({
+            "type": "assistant",
+            "timestamp": "T",
+            "message": {
+                "role": "assistant",
+                "content": [{
+                    "type": "citation",
+                    "cited_text": "Tokio is an async runtime",
+                    "source": { "title": "Tokio", "url": "https://tokio.rs" }
+                }]
+            }
+        })
+        .to_string();
+        let entries = parse_line(&line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.starts_with("[citation]"));
+        assert!(entries[0].content.contains("Tokio"));
+        assert!(entries[0].content.contains("https://tokio.rs"));
+    }
+
+    #[test]
+    fn compact_summary_flag_propagates_to_entries() {
+        let line = json!({
+            "type": "user",
+            "isCompactSummary": true,
+            "logicalParentUuid": "lp-7",
+            "timestamp": "T",
+            "message": { "role": "user", "content": "[summarised prior turns]" }
+        })
+        .to_string();
+        let entries = parse_line(&line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].is_compact_summary);
+        assert_eq!(entries[0].logical_parent_uuid.as_deref(), Some("lp-7"));
     }
 
     #[test]

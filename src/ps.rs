@@ -4,7 +4,10 @@ use std::io::IsTerminal;
 use crossterm::style::{Color, Stylize};
 
 use crate::cli::PsOpts;
-use crate::discovery::{IdeAttachment, TodoSummary, load_all_todos, load_ide_attachments};
+use crate::discovery::{
+    IdeAttachment, ProjectArtifacts, SettingsSummary, TodoSummary, load_all_todos,
+    load_ide_attachments, load_project_artifacts_for_cwd, load_settings_summary,
+};
 use crate::format::resolve_color;
 use crate::parser::{TeamConfig, find_teams, load_team_config};
 
@@ -26,15 +29,29 @@ pub fn run(opts: PsOpts) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Best-effort discovery (both return empty map on failure).
+    // Best-effort discovery (all return empty on failure).
     let todos = load_all_todos();
     let ides = load_ide_attachments();
+    // Settings are global (one file under ~/.claude/) so read once and
+    // reuse for every team in the output.
+    let settings = load_settings_summary();
 
     if opts.json {
-        return print_ps_json(&teams, explicit_team, &todos, &ides);
+        return print_ps_json(&teams, explicit_team, &todos, &ides, &settings);
     }
 
     let no_color = !std::io::stdout().is_terminal() || std::env::var("NO_COLOR").is_ok();
+
+    // Global harness configuration — hooks/permissions in ~/.claude/settings.json
+    // are the same for every team, so print once at the top.
+    if !settings.is_empty() {
+        let line = format_settings_line(&settings);
+        if no_color {
+            println!("{line}");
+        } else {
+            println!("{}", line.with(Color::DarkGrey));
+        }
+    }
 
     for team_name in &teams {
         let config = match load_team_config(team_name) {
@@ -61,6 +78,22 @@ pub fn run(opts: PsOpts) -> anyhow::Result<()> {
                 println!("{line}");
             } else {
                 println!("{}", line.with(Color::Magenta));
+            }
+        }
+
+        // Per-project artefact counts (memory / file-history) for this
+        // team's cwd. Only emit when there's something to report so empty
+        // projects don't grow the ps header.
+        let artifacts = load_project_artifacts_for_cwd(&config.cwd);
+        if !artifacts.is_empty() {
+            let line = format!(
+                "Artifacts: {} memory file(s), {} checkpoint(s)",
+                artifacts.memory_files, artifacts.file_history_snapshots
+            );
+            if no_color {
+                println!("{line}");
+            } else {
+                println!("{}", line.with(Color::DarkGrey));
             }
         }
 
@@ -95,6 +128,7 @@ fn print_ps_json(
     explicit_team: bool,
     todos: &HashMap<String, TodoSummary>,
     ides: &HashMap<String, IdeAttachment>,
+    settings: &SettingsSummary,
 ) -> anyhow::Result<()> {
     let mut result: Vec<serde_json::Value> = Vec::new();
 
@@ -110,7 +144,8 @@ fn print_ps_json(
             }
         };
 
-        let team_value = build_team_json(&config, todos, ides);
+        let artifacts = load_project_artifacts_for_cwd(&config.cwd);
+        let team_value = build_team_json(&config, todos, ides, &artifacts, settings);
         result.push(team_value);
     }
 
@@ -118,12 +153,30 @@ fn print_ps_json(
     Ok(())
 }
 
-/// Build a single team's JSON value, including `todos` on members (when present)
-/// and `ide` on the team (when attached).
+/// Render the single-line settings summary shown above the team list.
+fn format_settings_line(s: &SettingsSummary) -> String {
+    let hooks = if s.hooks.is_empty() {
+        "(none)".to_string()
+    } else {
+        s.hooks.join(", ")
+    };
+    if s.permission_rules == 0 {
+        format!("Hooks: {hooks}")
+    } else {
+        format!("Hooks: {hooks} · {} permission rule(s)", s.permission_rules)
+    }
+}
+
+/// Build a single team's JSON value, including `todos` on members (when present),
+/// `ide` on the team (when attached), `artifacts` (memory/file-history counts
+/// for the team's cwd when non-zero), and `settings` (global hooks/permissions
+/// when non-empty).
 fn build_team_json(
     config: &TeamConfig,
     todos: &HashMap<String, TodoSummary>,
     ides: &HashMap<String, IdeAttachment>,
+    artifacts: &ProjectArtifacts,
+    settings: &SettingsSummary,
 ) -> serde_json::Value {
     let members: Vec<serde_json::Value> = config
         .members
@@ -144,6 +197,26 @@ fn build_team_json(
             serde_json::json!({
                 "name": att.ide_name,
                 "workspace": att.workspace,
+            }),
+        );
+    }
+
+    if !artifacts.is_empty() {
+        obj.insert(
+            "artifacts".to_string(),
+            serde_json::json!({
+                "memory_files": artifacts.memory_files,
+                "file_history_snapshots": artifacts.file_history_snapshots,
+            }),
+        );
+    }
+
+    if !settings.is_empty() {
+        obj.insert(
+            "settings".to_string(),
+            serde_json::json!({
+                "hooks": settings.hooks,
+                "permission_rules": settings.permission_rules,
             }),
         );
     }
@@ -343,7 +416,13 @@ mod tests {
         );
         let ides: HashMap<String, IdeAttachment> = HashMap::new();
 
-        let v = build_team_json(&config, &todos, &ides);
+        let v = build_team_json(
+            &config,
+            &todos,
+            &ides,
+            &ProjectArtifacts::default(),
+            &SettingsSummary::default(),
+        );
 
         assert_eq!(v["team"], "t");
         let members = v["members"].as_array().unwrap();
@@ -358,6 +437,8 @@ mod tests {
 
         // No IDE attached.
         assert!(v.get("ide").is_none());
+        assert!(v.get("artifacts").is_none());
+        assert!(v.get("settings").is_none());
     }
 
     #[test]
@@ -373,7 +454,13 @@ mod tests {
         todos.insert("worker-a".to_string(), TodoSummary::default());
         let ides: HashMap<String, IdeAttachment> = HashMap::new();
 
-        let v = build_team_json(&config, &todos, &ides);
+        let v = build_team_json(
+            &config,
+            &todos,
+            &ides,
+            &ProjectArtifacts::default(),
+            &SettingsSummary::default(),
+        );
 
         let m = &v["members"].as_array().unwrap()[0];
         assert!(
@@ -390,7 +477,13 @@ mod tests {
         let todos: HashMap<String, TodoSummary> = HashMap::new();
         let ides: HashMap<String, IdeAttachment> = HashMap::new();
 
-        let v = build_team_json(&config, &todos, &ides);
+        let v = build_team_json(
+            &config,
+            &todos,
+            &ides,
+            &ProjectArtifacts::default(),
+            &SettingsSummary::default(),
+        );
         let m = &v["members"].as_array().unwrap()[0];
         assert!(m.get("todos").is_none());
     }
@@ -410,10 +503,63 @@ mod tests {
             },
         );
 
-        let v = build_team_json(&config, &todos, &ides);
+        let v = build_team_json(
+            &config,
+            &todos,
+            &ides,
+            &ProjectArtifacts::default(),
+            &SettingsSummary::default(),
+        );
         let ide = v.get("ide").expect("expected ide key");
         assert_eq!(ide["name"], "VS Code");
         assert_eq!(ide["workspace"], cwd);
+    }
+
+    #[test]
+    fn ps_json_includes_artifacts_and_settings_when_present() {
+        let config = sample_config(
+            "t",
+            "/tmp/does-not-exist-cc-ps",
+            vec![sample_member("worker-a", true)],
+        );
+        let todos: HashMap<String, TodoSummary> = HashMap::new();
+        let ides: HashMap<String, IdeAttachment> = HashMap::new();
+        let artifacts = ProjectArtifacts {
+            memory_files: 2,
+            file_history_snapshots: 7,
+        };
+        let settings = SettingsSummary {
+            hooks: vec!["PreToolUse".into(), "SessionStart".into()],
+            permission_rules: 4,
+        };
+
+        let v = build_team_json(&config, &todos, &ides, &artifacts, &settings);
+        let a = v.get("artifacts").expect("expected artifacts key");
+        assert_eq!(a["memory_files"], 2);
+        assert_eq!(a["file_history_snapshots"], 7);
+        let s = v.get("settings").expect("expected settings key");
+        assert_eq!(s["permission_rules"], 4);
+        let hooks = s["hooks"].as_array().unwrap();
+        assert_eq!(hooks.len(), 2);
+    }
+
+    #[test]
+    fn format_settings_line_renders_hooks_and_rules() {
+        let s = SettingsSummary {
+            hooks: vec!["PreToolUse".into(), "PostToolUse".into()],
+            permission_rules: 3,
+        };
+        let line = format_settings_line(&s);
+        assert!(line.contains("PreToolUse"));
+        assert!(line.contains("3 permission rule"));
+
+        let empty_rules = SettingsSummary {
+            hooks: vec!["SessionStart".into()],
+            permission_rules: 0,
+        };
+        let line = format_settings_line(&empty_rules);
+        assert!(line.contains("SessionStart"));
+        assert!(!line.contains("permission rule"));
     }
 
     #[test]

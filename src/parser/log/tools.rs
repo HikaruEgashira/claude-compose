@@ -75,6 +75,19 @@ pub(crate) fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String
         }
         "AskUserQuestion" => ask_user_question(&input),
 
+        // --- auto-memory (Claude Code 2026+) --------------------------
+        "Memory" | "MemoryRead" | "MemoryWrite" => memory_tool(tool_name, &input),
+
+        // --- desktop control -----------------------------------------
+        // `computer_use` blocks may omit `name` (we default to "Computer"
+        // in the block dispatcher); both paths land here.
+        "Computer" | "computer_use" => computer_tool(&input),
+
+        // --- server-hosted code execution -----------------------------
+        // The on-server variant is lower-cased (`code_execution`) while
+        // the Claude Code-side name is PascalCase (`CodeExecution`).
+        "CodeExecution" | "code_execution" => code_execution(&input),
+
         // --- namespaced MCP servers -----------------------------------
         name if name.starts_with("mcp__") => mcp_namespaced(name, &input),
 
@@ -288,6 +301,67 @@ fn ask_user_question(input: &Value) -> String {
     truncate_chars(question, 60)
 }
 
+/// Summarise a Memory / MemoryRead / MemoryWrite invocation.
+///
+/// The auto-memory tool family writes to `~/.claude/projects/<cwd>/memory/`.
+/// The `Memory` alias accepts an `operation` (view/create/str_replace/insert/
+/// delete/rename) — we surface that plus the path so a reader can tell a
+/// lookup apart from a mutation.
+fn memory_tool(name: &str, input: &Value) -> String {
+    // Accept both the unified `Memory` shape (operation + path) and the
+    // split `MemoryRead` / `MemoryWrite` shapes (path + content).
+    let path = str_field(input, "path").unwrap_or_default();
+    let op = match name {
+        "MemoryRead" => "read".to_string(),
+        "MemoryWrite" => "write".to_string(),
+        _ => str_field(input, "operation")
+            .or_else(|| str_field(input, "command"))
+            .unwrap_or_else(|| "op".to_string()),
+    };
+    if path.is_empty() {
+        op
+    } else {
+        format!("{op} {path}")
+    }
+}
+
+/// Summarise a `Computer` / `computer_use` invocation. The `action`
+/// parameter (screenshot, click, key, type, …) is the single most useful
+/// hint; include coordinates/text when the action carries them.
+fn computer_tool(input: &Value) -> String {
+    let action = str_field(input, "action").unwrap_or_else(|| "action".to_string());
+    // Position carried as either a bare `coordinate: [x, y]` pair or
+    // separate `x` / `y` fields. Keep it compact.
+    let coord = match input.get("coordinate").and_then(|v| v.as_array()) {
+        Some(arr) if arr.len() == 2 => {
+            let x = arr[0].as_i64().unwrap_or(0);
+            let y = arr[1].as_i64().unwrap_or(0);
+            Some(format!("({x},{y})"))
+        }
+        _ => None,
+    };
+    let text = str_field(input, "text").map(|t| truncate_chars(&t, 40));
+
+    match (coord, text) {
+        (Some(c), Some(t)) => format!("{action} {c} {t:?}"),
+        (Some(c), None) => format!("{action} {c}"),
+        (None, Some(t)) => format!("{action} {t:?}"),
+        (None, None) => action,
+    }
+}
+
+/// Summarise a server-hosted `code_execution` / `CodeExecution` call.
+/// The payload is a code snippet — preserve the language hint when present.
+fn code_execution(input: &Value) -> String {
+    let code = str_field(input, "code").unwrap_or_default();
+    let lang = str_field(input, "language").or_else(|| str_field(input, "lang"));
+    let compact = truncate_chars(&code, 80);
+    match lang {
+        Some(l) => format!("[{l}] {compact}"),
+        None => compact,
+    }
+}
+
 fn mcp_namespaced(name: &str, input: &Value) -> String {
     let parts: Vec<&str> = name.splitn(3, "__").collect();
     let server = parts.get(1).copied().unwrap_or("");
@@ -478,5 +552,58 @@ mod tests {
     fn mcp_namespaced_includes_server_and_tool() {
         let s = summary("mcp__github__get_me", json!({ "x": 1 }));
         assert!(s.starts_with("[github] get_me: "));
+    }
+
+    #[test]
+    fn memory_read_and_write_surface_operation_and_path() {
+        let s = summary("MemoryRead", json!({ "path": "/notes/goals.md" }));
+        assert_eq!(s, "read /notes/goals.md");
+        let s = summary(
+            "MemoryWrite",
+            json!({ "path": "/notes/today.md", "content": "..." }),
+        );
+        assert_eq!(s, "write /notes/today.md");
+    }
+
+    #[test]
+    fn memory_unified_tool_reads_operation() {
+        let s = summary(
+            "Memory",
+            json!({ "operation": "str_replace", "path": "/notes/x.md" }),
+        );
+        assert_eq!(s, "str_replace /notes/x.md");
+        // `operation` missing but `command` present (older meta shape)
+        let s = summary(
+            "Memory",
+            json!({ "command": "view", "path": "/notes/x.md" }),
+        );
+        assert_eq!(s, "view /notes/x.md");
+    }
+
+    #[test]
+    fn computer_tool_summarises_action_and_coords() {
+        let s = summary(
+            "Computer",
+            json!({ "action": "left_click", "coordinate": [120, 240] }),
+        );
+        assert_eq!(s, "left_click (120,240)");
+        let s = summary(
+            "Computer",
+            json!({ "action": "type", "text": "hello world" }),
+        );
+        assert_eq!(s, "type \"hello world\"");
+        let s = summary("Computer", json!({ "action": "screenshot" }));
+        assert_eq!(s, "screenshot");
+    }
+
+    #[test]
+    fn code_execution_includes_language_hint() {
+        let s = summary(
+            "CodeExecution",
+            json!({ "language": "python", "code": "print(1+1)" }),
+        );
+        assert_eq!(s, "[python] print(1+1)");
+        let s = summary("code_execution", json!({ "code": "1+1" }));
+        assert_eq!(s, "1+1");
     }
 }
