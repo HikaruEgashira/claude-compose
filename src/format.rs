@@ -102,6 +102,7 @@ fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
             let icon = tool_icon(tool, &entry.content, no_color);
             if matches!(tool, "SendMessage" | "TaskCreate")
                 || (tool == "TaskUpdate" && entry.content.contains("completed"))
+                || tool.starts_with("mcp__")
             {
                 format!("{icon} {}", entry.content)
             } else {
@@ -375,7 +376,10 @@ mod tests {
         let mut entry = make_entry(EntryType::ToolUse, "[github] get_me: {}");
         entry.tool_name = Some("mcp__github__get_me".to_string());
         let output = format_entry(&entry, false, true, 20, false);
-        assert!(output.contains("[mcp]"));
+        // MCP entries already carry the namespaced prefix in their content,
+        // so the formatter must not duplicate the raw tool name.
+        assert!(output.contains("[mcp] [github] get_me:"));
+        assert!(!output.contains("mcp__github__get_me"));
     }
 
     #[test]

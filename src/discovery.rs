@@ -60,7 +60,12 @@ pub fn load_all_todos_from(base: &Path) -> HashMap<String, TodoSummary> {
         return out;
     };
 
-    for entry in entries.flatten() {
+    // Sort by filename so "first file wins" collisions resolve deterministically
+    // regardless of filesystem enumeration order.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
@@ -115,7 +120,12 @@ pub fn load_ide_attachments_from(base: &Path) -> HashMap<String, IdeAttachment> 
         return out;
     };
 
-    for entry in entries.flatten() {
+    // Sort by filename so "first file wins" collisions resolve deterministically
+    // regardless of filesystem enumeration order.
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("lock") {
             continue;

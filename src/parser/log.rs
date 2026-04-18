@@ -749,7 +749,12 @@ fn parse_result(
             parts.push(format!("turns={n}"));
         }
         if let Some(c) = total_cost {
-            parts.push(format!("cost=${c:.2}"));
+            // Claude API costs can be sub-cent; format with enough precision to
+            // preserve small values, then strip trailing zeros so common values
+            // still render compactly (e.g. `$0.12`, not `$0.120000`).
+            let raw = format!("{c:.6}");
+            let trimmed = raw.trim_end_matches('0').trim_end_matches('.');
+            parts.push(format!("cost=${trimmed}"));
         }
         if parts.is_empty() {
             format!("session result: {subtype}")
@@ -921,7 +926,24 @@ mod tests {
         assert_eq!(entries[0].message_type, EntryType::Result);
         assert!(entries[0].content.contains("session result: success"));
         assert!(entries[0].content.contains("turns=5"));
-        assert!(entries[0].content.contains("cost=$0.12"));
+        assert!(entries[0].content.contains("cost=$0.1234"));
+    }
+
+    #[test]
+    fn parse_result_preserves_small_cost() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.004,"num_turns":1,"timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("cost=$0.004"));
+    }
+
+    #[test]
+    fn parse_result_trims_trailing_zeros() {
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":2.5,"num_turns":1,"timestamp":"T"}"#;
+        let entries = parse_line(line, "a", None);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].content.contains("cost=$2.5"));
+        assert!(!entries[0].content.contains("cost=$2.500000"));
     }
 
     #[test]
