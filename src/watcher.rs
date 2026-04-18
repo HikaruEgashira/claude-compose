@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -9,8 +9,8 @@ use tokio::sync::mpsc;
 use crate::cli::{LogsOpts, MessageType};
 use crate::format::{format_entry, format_entry_json};
 use crate::parser::{
-    EntryType, LogEntry, TeamConfig, claude_home, cwd_to_project_key, discover_member_sessions,
-    load_team_config, parse_line, project_log_dir, read_subagent_name,
+    EntryType, LogEntry, TagKind, TeamConfig, claude_home, cwd_to_project_key,
+    discover_member_sessions, load_team_config, parse_line, project_log_dir, read_subagent_name,
     resolve_member_session_via_tmux,
 };
 
@@ -26,13 +26,29 @@ pub struct AgentFile {
 
 pub async fn run(opts: LogsOpts) -> anyhow::Result<()> {
     let mut agent_files = discover_files(&opts)?;
-    let max_name_width = tail_entries(&mut agent_files, &opts)?;
+    // Deduplication set shared across tail + follow. Claude Code's
+    // stream-json input is known to emit duplicate JSONL lines
+    // (anthropics/claude-code#5034); we skip any entry whose uuid has
+    // already been printed.
+    let mut seen_uuids: HashSet<String> = HashSet::new();
+    let max_name_width = tail_entries(&mut agent_files, &opts, &mut seen_uuids)?;
 
     if opts.follow {
-        follow_events(&mut agent_files, &opts, max_name_width).await?;
+        follow_events(&mut agent_files, &opts, max_name_width, &mut seen_uuids).await?;
     }
 
     Ok(())
+}
+
+/// Returns true when the entry should be skipped as a duplicate.
+/// Entries with `None` uuid pass through unchanged (no fingerprint to
+/// deduplicate on). First-seen uuids are inserted and allowed through.
+fn is_duplicate_uuid(entry: &LogEntry, seen: &mut HashSet<String>) -> bool {
+    if let Some(uuid) = entry.uuid.as_deref() {
+        !seen.insert(uuid.to_string())
+    } else {
+        false
+    }
 }
 
 /// Discover agent log files based on --team flag or auto-detection.
@@ -76,7 +92,11 @@ fn discover_files(opts: &LogsOpts) -> anyhow::Result<Vec<AgentFile>> {
 
 /// Read existing log entries from all agent files, apply tail limit, and print.
 /// Returns the computed max_name_width for consistent formatting in follow mode.
-fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Result<usize> {
+fn tail_entries(
+    agent_files: &mut [AgentFile],
+    opts: &LogsOpts,
+    seen_uuids: &mut HashSet<String>,
+) -> anyhow::Result<usize> {
     let max_name_width = agent_files
         .iter()
         .map(|af| af.agent_name.len())
@@ -93,9 +113,19 @@ fn tail_entries(agent_files: &mut [AgentFile], opts: &LogsOpts) -> anyhow::Resul
 
     let start = all_entries.len().saturating_sub(opts.tail);
     for entry in &all_entries[start..] {
-        if matches_filter(&entry.message_type, &opts.type_filter) {
-            print_entry(entry, opts, max_name_width);
+        if !matches_filter(entry, &opts.type_filter) {
+            continue;
         }
+        if should_skip_thinking(&entry.message_type, opts) {
+            continue;
+        }
+        if should_skip_sidechain(entry, opts) {
+            continue;
+        }
+        if is_duplicate_uuid(entry, seen_uuids) {
+            continue;
+        }
+        print_entry(entry, opts, max_name_width);
     }
 
     Ok(max_name_width)
@@ -106,6 +136,7 @@ async fn follow_events(
     agent_files: &mut Vec<AgentFile>,
     opts: &LogsOpts,
     max_name_width: usize,
+    seen_uuids: &mut HashSet<String>,
 ) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::channel::<PathBuf>(256);
 
@@ -203,7 +234,16 @@ async fn follow_events(
             let af = &mut agent_files[idx];
             let new_entries = read_new_lines(af)?;
             for entry in new_entries {
-                if !matches_filter(&entry.message_type, &opts.type_filter) {
+                if !matches_filter(&entry, &opts.type_filter) {
+                    continue;
+                }
+                if should_skip_thinking(&entry.message_type, opts) {
+                    continue;
+                }
+                if should_skip_sidechain(&entry, opts) {
+                    continue;
+                }
+                if is_duplicate_uuid(&entry, seen_uuids) {
                     continue;
                 }
                 print_entry(&entry, opts, max_name_width);
@@ -692,16 +732,61 @@ fn color_for_name(name: &str) -> String {
     DEFAULT_COLORS[(hash as usize) % DEFAULT_COLORS.len()].to_string()
 }
 
-fn matches_filter(entry_type: &EntryType, filter: &Option<MessageType>) -> bool {
+fn matches_filter(entry: &LogEntry, filter: &Option<MessageType>) -> bool {
     let Some(f) = filter else { return true };
+    // Tag-based filters match User/Assistant entries that carry a specific
+    // TagKind. They are independent of the base EntryType mapping below
+    // (EntryType::User / Assistant continue to match --type user/assistant
+    // for tagged entries too).
+    let is_user_or_assistant = matches!(entry.message_type, EntryType::User | EntryType::Assistant);
+    match f {
+        MessageType::SlashCommand => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::SlashCommand);
+        }
+        MessageType::Hook => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::Hook);
+        }
+        MessageType::Reminder => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::SystemReminder);
+        }
+        _ => {}
+    }
     matches!(
-        (f, entry_type),
+        (f, &entry.message_type),
         (MessageType::Assistant, EntryType::Assistant)
             | (MessageType::User, EntryType::User)
             | (MessageType::System, EntryType::System)
             | (MessageType::ToolUse, EntryType::ToolUse)
             | (MessageType::ToolResult, EntryType::ToolResult)
+            | (MessageType::Thinking, EntryType::Thinking)
+            | (MessageType::Summary, EntryType::Summary)
+            | (MessageType::Result, EntryType::Result)
+            | (MessageType::Snapshot, EntryType::Snapshot)
     )
+}
+
+/// Decide whether to skip a Thinking entry based on `--show-thinking` and
+/// the active type filter. Thinking entries are hidden by default unless:
+///   - the user explicitly passed `--show-thinking`, OR
+///   - the user explicitly filtered to `--type thinking`.
+fn should_skip_thinking(entry_type: &EntryType, opts: &LogsOpts) -> bool {
+    if *entry_type != EntryType::Thinking {
+        return false;
+    }
+    if opts.show_thinking {
+        return false;
+    }
+    if matches!(opts.type_filter, Some(MessageType::Thinking)) {
+        return false;
+    }
+    true
+}
+
+/// Decide whether to skip a sidechain (subagent/Task-tool) entry.
+/// Sidechain entries are shown by default; they are only suppressed when
+/// the user explicitly passed `--hide-sidechain`.
+fn should_skip_sidechain(entry: &LogEntry, opts: &LogsOpts) -> bool {
+    opts.hide_sidechain && entry.is_sidechain
 }
 
 fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
@@ -710,7 +795,13 @@ fn print_entry(entry: &LogEntry, opts: &LogsOpts, max_name_width: usize) {
     } else {
         println!(
             "{}",
-            format_entry(entry, opts.verbose, opts.no_color, max_name_width)
+            format_entry(
+                entry,
+                opts.verbose,
+                opts.no_color,
+                max_name_width,
+                opts.show_metadata
+            )
         );
     }
 }
@@ -779,6 +870,198 @@ fn parent_pid(pid: u32) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_logs_opts() -> LogsOpts {
+        LogsOpts {
+            follow: false,
+            tail: 50,
+            type_filter: None,
+            json: false,
+            no_color: true,
+            team: None,
+            verbose: false,
+            show_thinking: false,
+            hide_sidechain: false,
+            show_metadata: false,
+            agents: vec![],
+        }
+    }
+
+    fn make_entry_for_filter(kind: EntryType) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "a".to_string(),
+            agent_color: None,
+            message_type: kind,
+            content: String::new(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain: false,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn matches_filter_none_passes_all() {
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Thinking),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Summary),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Result),
+            &None
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Snapshot),
+            &None
+        ));
+    }
+
+    #[test]
+    fn matches_filter_maps_new_variants() {
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Thinking),
+            &Some(MessageType::Thinking)
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Summary),
+            &Some(MessageType::Summary)
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Result),
+            &Some(MessageType::Result)
+        ));
+        assert!(matches_filter(
+            &make_entry_for_filter(EntryType::Snapshot),
+            &Some(MessageType::Snapshot)
+        ));
+        assert!(!matches_filter(
+            &make_entry_for_filter(EntryType::Assistant),
+            &Some(MessageType::Thinking)
+        ));
+    }
+
+    #[test]
+    fn filter_user_includes_tagged_entries() {
+        // A User entry that carries a slash-command tag should still match
+        // the plain --type user filter.
+        let mut entry = make_entry_for_filter(EntryType::User);
+        entry.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&entry, &Some(MessageType::User)));
+    }
+
+    #[test]
+    fn filter_slash_command_includes_tagged_entries() {
+        let mut user = make_entry_for_filter(EntryType::User);
+        user.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&user, &Some(MessageType::SlashCommand)));
+
+        let mut assistant = make_entry_for_filter(EntryType::Assistant);
+        assistant.tag = Some(TagKind::SlashCommand);
+        assert!(matches_filter(&assistant, &Some(MessageType::SlashCommand)));
+
+        // A non-slash-command tag must NOT match --type slash-command.
+        let mut hook = make_entry_for_filter(EntryType::User);
+        hook.tag = Some(TagKind::Hook);
+        assert!(!matches_filter(&hook, &Some(MessageType::SlashCommand)));
+    }
+
+    #[test]
+    fn filter_hook_excludes_untagged_entries() {
+        // Untagged user entry must not match --type hook.
+        let untagged = make_entry_for_filter(EntryType::User);
+        assert!(!matches_filter(&untagged, &Some(MessageType::Hook)));
+
+        // Tagged with a *different* kind must not match.
+        let mut reminder = make_entry_for_filter(EntryType::User);
+        reminder.tag = Some(TagKind::SystemReminder);
+        assert!(!matches_filter(&reminder, &Some(MessageType::Hook)));
+
+        // Tool-use entries never carry tags and must not match tag filters.
+        let tool = make_entry_for_filter(EntryType::ToolUse);
+        assert!(!matches_filter(&tool, &Some(MessageType::Hook)));
+
+        // A properly hook-tagged entry passes.
+        let mut hook = make_entry_for_filter(EntryType::User);
+        hook.tag = Some(TagKind::Hook);
+        assert!(matches_filter(&hook, &Some(MessageType::Hook)));
+    }
+
+    #[test]
+    fn filter_reminder_matches_system_reminder_tag() {
+        let mut reminder = make_entry_for_filter(EntryType::User);
+        reminder.tag = Some(TagKind::SystemReminder);
+        assert!(matches_filter(&reminder, &Some(MessageType::Reminder)));
+
+        let untagged = make_entry_for_filter(EntryType::User);
+        assert!(!matches_filter(&untagged, &Some(MessageType::Reminder)));
+    }
+
+    #[test]
+    fn thinking_hidden_by_default() {
+        let opts = make_logs_opts();
+        assert!(should_skip_thinking(&EntryType::Thinking, &opts));
+        assert!(!should_skip_thinking(&EntryType::Assistant, &opts));
+    }
+
+    #[test]
+    fn thinking_shown_with_show_thinking_flag() {
+        let mut opts = make_logs_opts();
+        opts.show_thinking = true;
+        assert!(!should_skip_thinking(&EntryType::Thinking, &opts));
+    }
+
+    #[test]
+    fn thinking_shown_with_explicit_type_filter() {
+        let mut opts = make_logs_opts();
+        opts.type_filter = Some(MessageType::Thinking);
+        assert!(!should_skip_thinking(&EntryType::Thinking, &opts));
+    }
+
+    fn make_sidechain_entry(is_sidechain: bool) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "agent".to_string(),
+            agent_color: None,
+            message_type: EntryType::Assistant,
+            content: "hi".to_string(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain,
+            uuid: None,
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn sidechain_shown_by_default() {
+        let opts = make_logs_opts();
+        let entry = make_sidechain_entry(true);
+        assert!(!should_skip_sidechain(&entry, &opts));
+    }
+
+    #[test]
+    fn sidechain_hidden_with_hide_sidechain_flag() {
+        let mut opts = make_logs_opts();
+        opts.hide_sidechain = true;
+        let sidechain = make_sidechain_entry(true);
+        let regular = make_sidechain_entry(false);
+        assert!(should_skip_sidechain(&sidechain, &opts));
+        assert!(!should_skip_sidechain(&regular, &opts));
+    }
 
     #[test]
     fn parent_pid_returns_valid_for_self() {
@@ -994,5 +1277,48 @@ mod tests {
     fn unique_name_with_collision() {
         let existing = vec![make_agent_file("proj"), make_agent_file("proj-2")];
         assert_eq!(unique_name("proj", &existing), "proj-3");
+    }
+
+    fn entry_with_uuid(uuid: Option<&str>) -> LogEntry {
+        LogEntry {
+            timestamp: "T".to_string(),
+            agent_name: "agent".to_string(),
+            agent_color: None,
+            message_type: EntryType::Assistant,
+            content: "hi".to_string(),
+            tool_name: None,
+            is_error: false,
+            is_sidechain: false,
+            uuid: uuid.map(String::from),
+            parent_uuid: None,
+            model: None,
+            stop_reason: None,
+            usage: None,
+            tag: None,
+        }
+    }
+
+    #[test]
+    fn dedupe_by_uuid_skips_second_occurrence() {
+        let mut seen: HashSet<String> = HashSet::new();
+        let first = entry_with_uuid(Some("abc"));
+        let duplicate = entry_with_uuid(Some("abc"));
+        let novel = entry_with_uuid(Some("def"));
+
+        assert!(!is_duplicate_uuid(&first, &mut seen));
+        assert!(is_duplicate_uuid(&duplicate, &mut seen));
+        assert!(!is_duplicate_uuid(&novel, &mut seen));
+    }
+
+    #[test]
+    fn dedupe_by_uuid_passes_through_none_uuids() {
+        let mut seen: HashSet<String> = HashSet::new();
+        // Entries with no uuid always pass through — we have nothing to
+        // fingerprint them by, so they're considered unique.
+        let a = entry_with_uuid(None);
+        let b = entry_with_uuid(None);
+        assert!(!is_duplicate_uuid(&a, &mut seen));
+        assert!(!is_duplicate_uuid(&b, &mut seen));
+        assert!(seen.is_empty());
     }
 }

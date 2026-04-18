@@ -1,4 +1,5 @@
 mod cli;
+mod discovery;
 mod format;
 mod parser;
 mod ps;

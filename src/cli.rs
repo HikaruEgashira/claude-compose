@@ -60,6 +60,18 @@ pub struct LogsOpts {
     #[arg(long)]
     pub verbose: bool,
 
+    /// Show assistant thinking blocks (hidden by default)
+    #[arg(long)]
+    pub show_thinking: bool,
+
+    /// Hide sidechain (subagent/Task-tool) entries — shown by default
+    #[arg(long)]
+    pub hide_sidechain: bool,
+
+    /// Append per-record metadata (model, usage tokens) to each non-JSON line
+    #[arg(long)]
+    pub show_metadata: bool,
+
     /// Filter by agent names
     pub agents: Vec<String>,
 }
@@ -89,11 +101,23 @@ pub struct DownOpts {
     pub path: String,
 }
 
-#[derive(Clone, ValueEnum)]
+#[derive(Clone, ValueEnum, PartialEq)]
 pub enum MessageType {
     Assistant,
     User,
     System,
     ToolUse,
     ToolResult,
+    Thinking,
+    Summary,
+    Result,
+    Snapshot,
+    /// Match User/Assistant entries whose content carries a recognised
+    /// slash-command tag (e.g. `<command-name>`).
+    SlashCommand,
+    /// Match User/Assistant entries whose content carries a `*-hook` tag.
+    Hook,
+    /// Match User/Assistant entries whose content carries a
+    /// `<system-reminder>` tag.
+    Reminder,
 }
