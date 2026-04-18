@@ -154,17 +154,19 @@ fn print_ps_json(
 }
 
 /// Render the single-line settings summary shown above the team list.
+/// Reached only when the summary is non-empty, so this helper never needs
+/// to render a fully blank "(none)" state. When one of hooks or
+/// permission_rules is absent we drop its segment entirely rather than
+/// emit a `Hooks: (none) · …` form that reads oddly.
 fn format_settings_line(s: &SettingsSummary) -> String {
-    let hooks = if s.hooks.is_empty() {
-        "(none)".to_string()
-    } else {
-        s.hooks.join(", ")
-    };
-    if s.permission_rules == 0 {
-        format!("Hooks: {hooks}")
-    } else {
-        format!("Hooks: {hooks} · {} permission rule(s)", s.permission_rules)
+    let mut parts: Vec<String> = Vec::new();
+    if !s.hooks.is_empty() {
+        parts.push(format!("Hooks: {}", s.hooks.join(", ")));
     }
+    if s.permission_rules > 0 {
+        parts.push(format!("{} permission rule(s)", s.permission_rules));
+    }
+    parts.join(" · ")
 }
 
 /// Build a single team's JSON value, including `todos` on members (when present),
@@ -560,6 +562,16 @@ mod tests {
         let line = format_settings_line(&empty_rules);
         assert!(line.contains("SessionStart"));
         assert!(!line.contains("permission rule"));
+
+        // Hooks empty but permission rules present — must not emit a
+        // placeholder "Hooks: (none)" segment.
+        let rules_only = SettingsSummary {
+            hooks: Vec::new(),
+            permission_rules: 2,
+        };
+        let line = format_settings_line(&rules_only);
+        assert_eq!(line, "2 permission rule(s)");
+        assert!(!line.contains("Hooks"));
     }
 
     #[test]
