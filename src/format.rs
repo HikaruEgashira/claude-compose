@@ -46,7 +46,10 @@ pub fn format_entry(
     let color = resolve_color(entry.agent_color.as_deref());
 
     let styled_name = name.with(color).bold();
-    let styled_content = if entry.is_error {
+    // API-layer errors (rate limit, overloaded, ...) are rendered in the
+    // same red palette as tool-level errors so the reader gets a single
+    // "something went wrong" signal regardless of which layer failed.
+    let styled_content = if entry.is_error || entry.is_api_error {
         content.with(Color::Red).to_string()
     } else {
         render_inline_bold(&content)
@@ -146,12 +149,31 @@ fn format_content(entry: &LogEntry, verbose: bool, no_color: bool) -> String {
             let prefix = if no_color { "[snapshot] " } else { "\u{25f7} " };
             format!("{prefix}{}", entry.content)
         }
+        EntryType::CompactBoundary => {
+            // Auto-compaction boundary — render as a visible separator so
+            // a reader can tell where earlier context was summarised.
+            let rule = if no_color {
+                "=== compact boundary ==="
+            } else {
+                "─── compact boundary ───"
+            };
+            if entry.content.is_empty() || entry.content == "compact boundary" {
+                rule.to_string()
+            } else {
+                format!("{rule}  {}", entry.content)
+            }
+        }
         _ => {
             let tag_prefix = match entry.message_type {
                 EntryType::User | EntryType::Assistant => tag_prefix(entry.tag, no_color),
                 _ => String::new(),
             };
-            let body = if entry.is_error {
+            let body = if entry.is_api_error {
+                // Prefer the API-specific label so the reader can tell it
+                // apart from a tool-level failure.
+                let icon = if no_color { "[api-err]" } else { "\u{f071}" };
+                format!("{icon} {}", entry.content)
+            } else if entry.is_error {
                 let icon = if no_color { "[err]" } else { "\u{f071}" };
                 format!("{icon} {}", entry.content)
             } else {
@@ -179,6 +201,8 @@ fn tag_prefix(tag: Option<TagKind>, no_color: bool) -> String {
             TagKind::SystemReminder => "[reminder]",
             TagKind::Ide => "[ide]",
             TagKind::Bash => "$",
+            TagKind::GitHubActivity => "[gh]",
+            TagKind::Env => "[env]",
         }
     } else {
         match kind {
@@ -187,6 +211,8 @@ fn tag_prefix(tag: Option<TagKind>, no_color: bool) -> String {
             TagKind::SystemReminder => "\u{24d8}",
             TagKind::Ide => "\u{2318}",
             TagKind::Bash => "$",
+            TagKind::GitHubActivity => "\u{f09b}", // github
+            TagKind::Env => "\u{f0ad}",            // wrench — env/context
         }
     };
     if no_color {
@@ -334,15 +360,7 @@ mod tests {
             agent_color: Some("blue".to_string()),
             message_type,
             content: content.to_string(),
-            tool_name: None,
-            is_error: false,
-            is_sidechain: false,
-            uuid: None,
-            parent_uuid: None,
-            model: None,
-            stop_reason: None,
-            usage: None,
-            tag: None,
+            ..LogEntry::default()
         }
     }
 
@@ -707,5 +725,55 @@ mod tests {
         let json = format_entry_json(&entry, false);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["content"].as_str().unwrap(), "[image: image/png]");
+    }
+
+    #[test]
+    fn test_format_compact_boundary_renders_separator() {
+        let entry = make_entry(EntryType::CompactBoundary, "compact boundary: trigger=auto");
+        let output = format_entry(&entry, false, true, 10, false);
+        assert!(
+            output.contains("=== compact boundary ==="),
+            "expected compact-boundary separator: {output:?}"
+        );
+        assert!(output.contains("trigger=auto"));
+    }
+
+    #[test]
+    fn test_format_compact_boundary_bare_content() {
+        let entry = make_entry(EntryType::CompactBoundary, "compact boundary");
+        let output = format_entry(&entry, false, true, 10, false);
+        // When there's no extra detail, we don't want "compact boundary"
+        // duplicated after the separator.
+        assert!(output.contains("=== compact boundary ==="));
+        assert!(!output.contains("compact boundary  compact boundary"));
+    }
+
+    #[test]
+    fn test_format_api_error_labelled_distinctly_no_color() {
+        let mut entry = make_entry(EntryType::System, "rate_limited");
+        entry.is_api_error = true;
+        let output = format_entry(&entry, false, true, 10, false);
+        assert!(
+            output.contains("[api-err]"),
+            "API-layer errors should carry an [api-err] label: {output:?}"
+        );
+    }
+
+    #[test]
+    fn test_format_api_error_distinguished_from_tool_error() {
+        // Tool-level and API-level errors use different labels so a
+        // reader can tell them apart even in the ASCII stream.
+        let mut api = make_entry(EntryType::System, "rate_limited");
+        api.is_api_error = true;
+        let api_out = format_entry(&api, false, true, 10, false);
+
+        let mut tool = make_entry(EntryType::System, "command not found");
+        tool.is_error = true;
+        let tool_out = format_entry(&tool, false, true, 10, false);
+
+        assert!(api_out.contains("[api-err]"));
+        assert!(tool_out.contains("[err]"));
+        assert!(!api_out.contains("[err] "));
+        assert!(!tool_out.contains("[api-err]"));
     }
 }

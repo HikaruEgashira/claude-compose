@@ -116,6 +116,9 @@ fn tail_entries(
         if !matches_filter(entry, &opts.type_filter) {
             continue;
         }
+        if !matches_time_and_session(entry, opts) {
+            continue;
+        }
         if should_skip_thinking(&entry.message_type, opts) {
             continue;
         }
@@ -235,6 +238,9 @@ async fn follow_events(
             let new_entries = read_new_lines(af)?;
             for entry in new_entries {
                 if !matches_filter(&entry, &opts.type_filter) {
+                    continue;
+                }
+                if !matches_time_and_session(&entry, opts) {
                     continue;
                 }
                 if should_skip_thinking(&entry.message_type, opts) {
@@ -749,6 +755,12 @@ fn matches_filter(entry: &LogEntry, filter: &Option<MessageType>) -> bool {
         MessageType::Reminder => {
             return is_user_or_assistant && entry.tag == Some(TagKind::SystemReminder);
         }
+        MessageType::GithubActivity => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::GitHubActivity);
+        }
+        MessageType::Env => {
+            return is_user_or_assistant && entry.tag == Some(TagKind::Env);
+        }
         _ => {}
     }
     matches!(
@@ -762,7 +774,40 @@ fn matches_filter(entry: &LogEntry, filter: &Option<MessageType>) -> bool {
             | (MessageType::Summary, EntryType::Summary)
             | (MessageType::Result, EntryType::Result)
             | (MessageType::Snapshot, EntryType::Snapshot)
+            | (MessageType::CompactBoundary, EntryType::CompactBoundary)
     )
+}
+
+/// Reject entries whose timestamp falls outside the `--since` / `--until`
+/// window, or whose `sessionId` doesn't match `--session`.
+///
+/// Timestamp comparison is lexicographic against the ISO-8601 string, which
+/// is equivalent to chronological order for the format Claude Code emits
+/// (`YYYY-MM-DDTHH:MM:SS.sssZ`). Missing/empty timestamps fall through.
+fn matches_time_and_session(entry: &LogEntry, opts: &LogsOpts) -> bool {
+    if let Some(since) = opts.since.as_deref() {
+        if !entry.timestamp.is_empty() && entry.timestamp.as_str() < since {
+            return false;
+        }
+    }
+    if let Some(until) = opts.until.as_deref() {
+        if !entry.timestamp.is_empty() && entry.timestamp.as_str() >= until {
+            return false;
+        }
+    }
+    if let Some(want) = opts.session.as_deref() {
+        match entry.session_id.as_deref() {
+            Some(sid) => {
+                if sid != want {
+                    return false;
+                }
+            }
+            // Entries without a sessionId pre-date the field; a user who
+            // passed --session wants a strict match, so drop them.
+            None => return false,
+        }
+    }
+    true
 }
 
 /// Decide whether to skip a Thinking entry based on `--show-thinking` and
@@ -883,6 +928,9 @@ mod tests {
             show_thinking: false,
             hide_sidechain: false,
             show_metadata: false,
+            since: None,
+            until: None,
+            session: None,
             agents: vec![],
         }
     }
@@ -891,18 +939,8 @@ mod tests {
         LogEntry {
             timestamp: "T".to_string(),
             agent_name: "a".to_string(),
-            agent_color: None,
             message_type: kind,
-            content: String::new(),
-            tool_name: None,
-            is_error: false,
-            is_sidechain: false,
-            uuid: None,
-            parent_uuid: None,
-            model: None,
-            stop_reason: None,
-            usage: None,
-            tag: None,
+            ..LogEntry::default()
         }
     }
 
@@ -1007,6 +1045,88 @@ mod tests {
     }
 
     #[test]
+    fn filter_github_activity_and_env_tags() {
+        let mut gh = make_entry_for_filter(EntryType::User);
+        gh.tag = Some(TagKind::GitHubActivity);
+        assert!(matches_filter(&gh, &Some(MessageType::GithubActivity)));
+        assert!(!matches_filter(&gh, &Some(MessageType::Env)));
+
+        let mut env = make_entry_for_filter(EntryType::User);
+        env.tag = Some(TagKind::Env);
+        assert!(matches_filter(&env, &Some(MessageType::Env)));
+        assert!(!matches_filter(&env, &Some(MessageType::GithubActivity)));
+    }
+
+    #[test]
+    fn filter_compact_boundary_matches_new_entry_type() {
+        let cb = make_entry_for_filter(EntryType::CompactBoundary);
+        assert!(matches_filter(&cb, &Some(MessageType::CompactBoundary)));
+        assert!(!matches_filter(&cb, &Some(MessageType::System)));
+    }
+
+    #[test]
+    fn time_filter_since_drops_earlier_entries() {
+        let mut opts = make_logs_opts();
+        opts.since = Some("2026-04-12T09:00:00".to_string());
+
+        let mut early = make_entry_for_filter(EntryType::Assistant);
+        early.timestamp = "2026-04-12T08:59:59.000Z".to_string();
+        assert!(!matches_time_and_session(&early, &opts));
+
+        let mut later = make_entry_for_filter(EntryType::Assistant);
+        later.timestamp = "2026-04-12T09:00:00.000Z".to_string();
+        assert!(matches_time_and_session(&later, &opts));
+    }
+
+    #[test]
+    fn time_filter_until_is_exclusive() {
+        let mut opts = make_logs_opts();
+        opts.until = Some("2026-04-12T10:00:00".to_string());
+
+        let mut at_bound = make_entry_for_filter(EntryType::Assistant);
+        at_bound.timestamp = "2026-04-12T10:00:00.000Z".to_string();
+        assert!(!matches_time_and_session(&at_bound, &opts));
+
+        let mut before = make_entry_for_filter(EntryType::Assistant);
+        before.timestamp = "2026-04-12T09:59:59.999Z".to_string();
+        assert!(matches_time_and_session(&before, &opts));
+    }
+
+    #[test]
+    fn time_filter_empty_timestamp_passes() {
+        // Summary records don't always carry a timestamp; we shouldn't
+        // silently drop them when a --since is set.
+        let mut opts = make_logs_opts();
+        opts.since = Some("2026-01-01".to_string());
+        let entry = make_entry_for_filter(EntryType::Summary);
+        assert_eq!(entry.timestamp, "T");
+        // With the default helper timestamp "T", lexical ordering makes
+        // "T" >= "2026-01-01", so it passes — use a genuinely empty ts:
+        let mut ts_empty = make_entry_for_filter(EntryType::Summary);
+        ts_empty.timestamp = String::new();
+        assert!(matches_time_and_session(&ts_empty, &opts));
+    }
+
+    #[test]
+    fn session_filter_requires_exact_match() {
+        let mut opts = make_logs_opts();
+        opts.session = Some("s-123".to_string());
+
+        let mut matching = make_entry_for_filter(EntryType::Assistant);
+        matching.session_id = Some("s-123".to_string());
+        assert!(matches_time_and_session(&matching, &opts));
+
+        let mut other = make_entry_for_filter(EntryType::Assistant);
+        other.session_id = Some("s-999".to_string());
+        assert!(!matches_time_and_session(&other, &opts));
+
+        let missing = make_entry_for_filter(EntryType::Assistant);
+        // Entries without a sessionId are excluded when --session is set,
+        // otherwise the filter wouldn't be a strict match.
+        assert!(!matches_time_and_session(&missing, &opts));
+    }
+
+    #[test]
     fn thinking_hidden_by_default() {
         let opts = make_logs_opts();
         assert!(should_skip_thinking(&EntryType::Thinking, &opts));
@@ -1031,18 +1151,10 @@ mod tests {
         LogEntry {
             timestamp: "T".to_string(),
             agent_name: "agent".to_string(),
-            agent_color: None,
             message_type: EntryType::Assistant,
             content: "hi".to_string(),
-            tool_name: None,
-            is_error: false,
             is_sidechain,
-            uuid: None,
-            parent_uuid: None,
-            model: None,
-            stop_reason: None,
-            usage: None,
-            tag: None,
+            ..LogEntry::default()
         }
     }
 
@@ -1283,18 +1395,10 @@ mod tests {
         LogEntry {
             timestamp: "T".to_string(),
             agent_name: "agent".to_string(),
-            agent_color: None,
             message_type: EntryType::Assistant,
             content: "hi".to_string(),
-            tool_name: None,
-            is_error: false,
-            is_sidechain: false,
             uuid: uuid.map(String::from),
-            parent_uuid: None,
-            model: None,
-            stop_reason: None,
-            usage: None,
-            tag: None,
+            ..LogEntry::default()
         }
     }
 
