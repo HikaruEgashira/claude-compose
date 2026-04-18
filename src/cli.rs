@@ -72,6 +72,20 @@ pub struct LogsOpts {
     #[arg(long)]
     pub show_metadata: bool,
 
+    /// Only show entries with timestamp >= this ISO-8601 value (lexicographic match).
+    /// Prefix accepted, e.g. `--since 2026-04-12` or `--since 2026-04-12T09:00`.
+    #[arg(long)]
+    pub since: Option<String>,
+
+    /// Only show entries with timestamp < this ISO-8601 value (lexicographic match).
+    #[arg(long)]
+    pub until: Option<String>,
+
+    /// Only show entries whose `sessionId` matches (exact). Lets you focus on
+    /// a single subagent when sidechain records are mixed into the stream.
+    #[arg(long)]
+    pub session: Option<String>,
+
     /// Filter by agent names
     pub agents: Vec<String>,
 }
@@ -112,12 +126,22 @@ pub enum MessageType {
     Summary,
     Result,
     Snapshot,
+    /// Match `system` records with `subtype: "compact_boundary"` — the
+    /// marker Claude Code emits when it auto-compacts the transcript.
+    CompactBoundary,
     /// Match User/Assistant entries whose content carries a recognised
     /// slash-command tag (e.g. `<command-name>`).
     SlashCommand,
-    /// Match User/Assistant entries whose content carries a `*-hook` tag.
+    /// Match User/Assistant entries whose content carries a `*-hook` tag
+    /// (covers hooks v1 and v2 variants).
     Hook,
     /// Match User/Assistant entries whose content carries a
     /// `<system-reminder>` tag.
     Reminder,
+    /// Match entries wrapped in `<github-webhook-activity>` (PR/CI events
+    /// injected by the GitHub integration).
+    GithubActivity,
+    /// Match environment-level injections (`<available-skills>`,
+    /// `<user-memory>`, `<current-branch>`, etc.).
+    Env,
 }
