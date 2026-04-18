@@ -729,10 +729,7 @@ mod tests {
 
     #[test]
     fn test_format_compact_boundary_renders_separator() {
-        let entry = make_entry(
-            EntryType::CompactBoundary,
-            "compact boundary: trigger=auto",
-        );
+        let entry = make_entry(EntryType::CompactBoundary, "compact boundary: trigger=auto");
         let output = format_entry(&entry, false, true, 10, false);
         assert!(
             output.contains("=== compact boundary ==="),

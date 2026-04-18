@@ -21,7 +21,10 @@ pub fn classify_tag(tag_name: &str) -> Option<TagKind> {
         "command-name" | "command-message" | "command-args" => Some(TagKind::SlashCommand),
         "system-reminder" => Some(TagKind::SystemReminder),
         "ide-selection" | "ide-diagnostic" | "ide-opened-files" => Some(TagKind::Ide),
-        "local-command-stdout" | "local-command-stderr" | "bash-input" | "bash-stdout"
+        "local-command-stdout"
+        | "local-command-stderr"
+        | "bash-input"
+        | "bash-stdout"
         | "bash-stderr" => Some(TagKind::Bash),
         "github-webhook-activity" => Some(TagKind::GitHubActivity),
         "available-skills"
@@ -129,7 +132,10 @@ mod tests {
         assert_eq!(classify_tag("available-skills"), Some(TagKind::Env));
         assert_eq!(classify_tag("user-memory"), Some(TagKind::Env));
         assert_eq!(classify_tag("current-branch"), Some(TagKind::Env));
-        assert_eq!(classify_tag("current-working-directory"), Some(TagKind::Env));
+        assert_eq!(
+            classify_tag("current-working-directory"),
+            Some(TagKind::Env)
+        );
     }
 
     #[test]

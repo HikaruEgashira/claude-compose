@@ -70,10 +70,9 @@ pub(crate) fn extract_tool_use_summary(tool_name: &str, block: &Value) -> String
         // --- infra / misc ---------------------------------------------
         "TodoWrite" => todo_write(&input),
         "ToolSearch" => str_field(&input, "query").unwrap_or_default(),
-        "PushNotification" => truncate_chars(
-            str_field(&input, "message").as_deref().unwrap_or(""),
-            80,
-        ),
+        "PushNotification" => {
+            truncate_chars(str_field(&input, "message").as_deref().unwrap_or(""), 80)
+        }
         "AskUserQuestion" => ask_user_question(&input),
 
         // --- namespaced MCP servers -----------------------------------
@@ -142,10 +141,7 @@ fn cron_create(input: &Value) -> String {
         .get("one_shot")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let prompt = input
-        .get("prompt")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let prompt = input.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
     let prefix = match (freq, one_shot) {
         (Some(f), _) => format!("[{f}] "),
         (None, true) => "[one-shot] ".to_string(),
@@ -273,10 +269,7 @@ fn todo_write(input: &Value) -> String {
     let in_progress = todos
         .iter()
         .filter(|t| {
-            let status = t
-                .get("status")
-                .and_then(|s| s.as_str())
-                .unwrap_or("");
+            let status = t.get("status").and_then(|s| s.as_str()).unwrap_or("");
             status == "in_progress" || t.get("activeForm").is_some_and(|v| !v.is_null())
         })
         .count();
@@ -439,7 +432,10 @@ mod tests {
 
     #[test]
     fn skill_plugin_namespace_split() {
-        let s = summary("Skill", json!({ "skill": "my-plugin:format", "args": "all" }));
+        let s = summary(
+            "Skill",
+            json!({ "skill": "my-plugin:format", "args": "all" }),
+        );
         assert_eq!(s, "[my-plugin] format all");
     }
 
@@ -466,7 +462,10 @@ mod tests {
 
     #[test]
     fn todo_write_empty_array_is_cleared() {
-        assert_eq!(summary("TodoWrite", json!({ "todos": [] })), "todos cleared");
+        assert_eq!(
+            summary("TodoWrite", json!({ "todos": [] })),
+            "todos cleared"
+        );
     }
 
     #[test]

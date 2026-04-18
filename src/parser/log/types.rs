@@ -45,33 +45,21 @@ pub struct LogEntry {
     pub tag: Option<TagKind>,
     /// Session id that produced this record — distinct from the file stem
     /// because sidechain entries may originate in a parent/child session.
-    #[serde(
-        rename = "sessionId",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "sessionId", skip_serializing_if = "Option::is_none", default)]
     pub session_id: Option<String>,
     /// Working directory at the time the record was written. May change
     /// mid-session (`cd` in Bash) so is carried per-entry.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub cwd: Option<String>,
     /// Git branch active when the record was written.
-    #[serde(
-        rename = "gitBranch",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "gitBranch", skip_serializing_if = "Option::is_none", default)]
     pub git_branch: Option<String>,
     /// Claude Code format/version string (e.g. `"2.0.47"`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub version: Option<String>,
     /// `"user"` vs `"agent"` — lets downstream distinguish Task-originated
     /// prompts from human ones.
-    #[serde(
-        rename = "userType",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "userType", skip_serializing_if = "Option::is_none", default)]
     pub user_type: Option<String>,
     /// Meta records (harness-inserted, not conversation) — e.g. the initial
     /// environment block.
@@ -86,11 +74,7 @@ pub struct LogEntry {
     )]
     pub is_api_error: bool,
     /// Correlates the record with the API request that produced it.
-    #[serde(
-        rename = "requestId",
-        skip_serializing_if = "Option::is_none",
-        default
-    )]
+    #[serde(rename = "requestId", skip_serializing_if = "Option::is_none", default)]
     pub request_id: Option<String>,
 }
 

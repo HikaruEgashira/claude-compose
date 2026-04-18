@@ -187,7 +187,8 @@ mod tests {
 
     #[test]
     fn parse_snapshot_message() {
-        let line = r#"{"type":"file-history-snapshot","messageId":"m","snapshot":{},"timestamp":"T"}"#;
+        let line =
+            r#"{"type":"file-history-snapshot","messageId":"m","snapshot":{},"timestamp":"T"}"#;
         let entries = parse_line(line, "a", None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].message_type, EntryType::Snapshot);
